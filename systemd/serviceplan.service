@@ -1,0 +1,16 @@
+[Unit]
+Description=ServicePlan Fahrzeug- und Wartungsverwaltung
+After=network.target
+
+[Service]
+Type=simple
+User=serviceplan
+Group=serviceplan
+WorkingDirectory=/opt/serviceplan
+EnvironmentFile=/etc/serviceplan.env
+ExecStart=/opt/serviceplan/venv/bin/gunicorn -w 2 -b 0.0.0.0:5000 app:app
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
