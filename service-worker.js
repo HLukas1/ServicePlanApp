@@ -1,6 +1,6 @@
 // ServicePlan Service Worker
 
-const CACHE_NAME = "serviceplan-shell-v7";
+const CACHE_NAME = "serviceplan-shell-v8";
 
 const SHELL_FILES = [
   "/",
@@ -48,26 +48,23 @@ self.addEventListener("fetch", (event) => {
     return;
   }
 
-  // App-Navigation:
-  // Erst Netzwerk versuchen, bei fehlendem Netz
-  // die gecachte Startseite verwenden.
+  // App-Navigation: die gespeicherte App sofort anzeigen. Das Netzwerk
+  // aktualisiert den Cache im Hintergrund, ohne den Start aufzuhalten.
   if (event.request.mode === "navigate") {
+    const networkUpdate = fetch(event.request).then((response) => {
+      if (response.ok) {
+        return caches.open(CACHE_NAME)
+          .then((cache) => cache.put("/", response.clone()))
+          .then(() => response);
+      }
+      return response;
+    });
+
+    // waitUntil wird synchron registriert, damit der Service Worker für
+    // die Cache-Aktualisierung im Hintergrund aktiv bleibt.
+    event.waitUntil(networkUpdate.then(() => undefined, () => undefined));
     event.respondWith(
-      fetch(event.request)
-        .then((response) => {
-          if (response.ok) {
-            const copy = response.clone();
-
-            caches.open(CACHE_NAME).then((cache) => {
-              cache.put("/", copy);
-            });
-          }
-
-          return response;
-        })
-        .catch(() => {
-          return caches.match("/");
-        })
+      caches.match("/").then((cached) => cached || networkUpdate)
     );
 
     return;
