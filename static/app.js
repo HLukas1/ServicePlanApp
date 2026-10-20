@@ -1334,6 +1334,7 @@ async function renderNoteFormView(vehicleId, noteId) {
 
 async function renderSettingsView() {
   const pending = (await idbGetAll("queue")).length;
+  const vehicles = (await idbGetAll("vehicles")).sort((a, b) => (a.name || "").localeCompare(b.name || ""));
   const lastSync = localStorage.getItem("lastSync");
 
   return `${offlineBannerHtml()}
@@ -1356,6 +1357,14 @@ async function renderSettingsView() {
             <button type="button" class="btn btn-primary" id="manual-sync-btn">Jetzt synchronisieren</button>
           <div id="manual-sync-result" class="sync-result" aria-live="polite"></div>
           </div>
+        </div>
+
+        <div class="card">
+          <h3 class="card-title">Fahrzeugbericht als PDF</h3>
+          <p class="card-text">Wähle ein Fahrzeug. Der Bericht enthält Fahrzeugdaten ohne Kosten und eine chronologische Wartungshistorie. Zugeordnete Dokumente werden am Ende als Seiten oder eingebettete Originaldateien angefügt.</p>
+          <div class="field"><label for="pdf-vehicle-select">Fahrzeug</label><select id="pdf-vehicle-select" ${vehicles.length ? "" : "disabled"}>${vehicles.length ? vehicles.map(v => `<option value="${escapeHtml(v.id)}">${escapeHtml(v.name || "Fahrzeug")}</option>`).join("") : `<option value="">Keine Fahrzeuge vorhanden</option>`}</select></div>
+          <button type="button" class="btn btn-primary" id="pdf-export-btn" ${vehicles.length ? "" : "disabled"}>PDF exportieren</button>
+          <div id="pdf-export-result" class="sync-result" aria-live="polite"></div>
         </div>
 
         <div class="card">
@@ -1675,6 +1684,40 @@ function bindSettings() {
   window.serverStatusTimer = setInterval(() => {
     updateServerStatus();
   }, 10000);
+
+  document.getElementById("pdf-export-btn")?.addEventListener("click", async (event) => {
+    const btn = event.currentTarget;
+    const vehicleSelect = document.getElementById("pdf-vehicle-select");
+    const result = document.getElementById("pdf-export-result");
+    const vehicleId = vehicleSelect?.value;
+    const vehicleName = vehicleSelect?.selectedOptions?.[0]?.textContent || "Fahrzeug";
+    if (!vehicleId) return;
+    btn.disabled = true;
+    btn.textContent = "PDF wird erstellt…";
+    if (result) result.textContent = "Bericht wird erstellt…";
+    try {
+      const response = await fetch(`/api/vehicles/${encodeURIComponent(vehicleId)}/export.pdf`, { headers: { "Authorization": `Bearer ${getToken()}` } });
+      if (!response.ok) {
+        let message = "PDF-Export fehlgeschlagen.";
+        try { const data = await response.json(); message = data.error || message; } catch (_) {}
+        throw new Error(message);
+      }
+      const blob = await response.blob();
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      const safeName = vehicleName.replace(/[^a-z0-9_-]+/gi, "_").replace(/^_+|_+$/g, "") || "Fahrzeug";
+      link.href = url;
+      link.download = `${safeName}_Wartungsbericht.pdf`;
+      document.body.appendChild(link); link.click(); link.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+      if (result) result.textContent = "PDF wurde erstellt und heruntergeladen.";
+    } catch (err) {
+      if (result) result.textContent = `PDF-Export fehlgeschlagen: ${err.message || err}`;
+    } finally {
+      btn.disabled = false;
+      btn.textContent = "PDF exportieren";
+    }
+  });
 
   document.getElementById("manual-sync-btn").addEventListener("click", async () => {
     const btn = document.getElementById("manual-sync-btn");

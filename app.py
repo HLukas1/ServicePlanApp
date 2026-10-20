@@ -664,6 +664,173 @@ def api_attachment_content(attachment_id):
     return send_file(path, mimetype=attachment.mime_type, download_name=attachment.filename, conditional=True)
 
 
+@app.route("/api/vehicles/<int:vehicle_id>/export.pdf")
+@require_token
+def api_export_vehicle_pdf(vehicle_id):
+    vehicle = db.get_or_404(Vehicle, vehicle_id)
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.units import mm
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak, Flowable
+    from xml.sax.saxutils import escape
+
+    services = Service.query.filter_by(vehicle_id=vehicle.id).order_by(Service.date.desc(), Service.id.desc()).all()
+    attachments = Attachment.query.filter_by(vehicle_id=vehicle.id).filter(Attachment.service_id.isnot(None)).all()
+    service_by_id = {service.id: service for service in services}
+    attachments_by_service = {}
+    for attachment in attachments:
+        if attachment.service_id in service_by_id:
+            attachments_by_service.setdefault(attachment.service_id, []).append(attachment)
+    for values in attachments_by_service.values():
+        values.sort(key=lambda item: (str(item.created_at or ""), item.id), reverse=True)
+
+    class AttachmentIcon(Flowable):
+        def __init__(self):
+            super().__init__()
+            self.width, self.height = 13, 15
+
+        def draw(self):
+            self.canv.saveState()
+            self.canv.setStrokeColor(colors.HexColor("#2563eb"))
+            self.canv.setLineWidth(1.5)
+            path = self.canv.beginPath()
+            path.moveTo(3, 4)
+            path.curveTo(1, 6, 1, 8, 3, 10)
+            path.lineTo(8, 14)
+            path.curveTo(11, 16, 14, 13, 11, 10)
+            path.lineTo(6, 5)
+            path.curveTo(5, 4, 3, 6, 4, 7)
+            path.lineTo(9, 12)
+            self.canv.drawPath(path, stroke=1, fill=0)
+            self.canv.restoreState()
+
+    output = io.BytesIO()
+    pdf = SimpleDocTemplate(output, pagesize=A4, rightMargin=17*mm, leftMargin=17*mm, topMargin=16*mm, bottomMargin=16*mm, title=f"Fahrzeugbericht - {vehicle.name}")
+    styles = getSampleStyleSheet()
+    styles.add(ParagraphStyle(name="VehicleTitle", parent=styles["Title"], textColor=colors.HexColor("#1d4ed8"), spaceAfter=12))
+    styles.add(ParagraphStyle(name="SmallNote", parent=styles["BodyText"], fontSize=8.5, leading=11))
+    story = [Paragraph("Fahrzeugbericht", styles["VehicleTitle"]), Paragraph(escape(vehicle.name or "Fahrzeug"), styles["Heading1"]), Spacer(1, 4*mm)]
+
+    vehicle_info = [
+        ("Marke", vehicle.brand), ("Modell", vehicle.model), ("Motor", vehicle.engine), ("Baujahr", vehicle.year),
+        ("Farbe", vehicle.color), ("Kennzeichen", vehicle.license_plate), ("FIN / VIN", vehicle.fin),
+        ("Kilometerstand", f"{vehicle.mileage} km" if vehicle.mileage is not None else None)
+    ]
+    vehicle_rows = []
+    for idx in range(0, len(vehicle_info), 2):
+        left, right = vehicle_info[idx], vehicle_info[idx + 1]
+        vehicle_rows.append([
+            Paragraph(f"<b>{escape(left[0])}</b><br/>{escape(str(left[1] or '–'))}", styles["BodyText"]),
+            Paragraph(f"<b>{escape(right[0])}</b><br/>{escape(str(right[1] or '–'))}", styles["BodyText"])
+        ])
+    vehicle_table = Table(vehicle_rows, colWidths=[87*mm, 87*mm], hAlign="LEFT")
+    vehicle_table.setStyle(TableStyle([("BACKGROUND", (0,0), (-1,-1), colors.HexColor("#f3f4f6")), ("BOX", (0,0), (-1,-1), .4, colors.HexColor("#d1d5db")), ("INNERGRID", (0,0), (-1,-1), .3, colors.HexColor("#d1d5db")), ("VALIGN", (0,0), (-1,-1), "TOP"), ("LEFTPADDING", (0,0), (-1,-1), 8), ("RIGHTPADDING", (0,0), (-1,-1), 8), ("TOPPADDING", (0,0), (-1,-1), 7), ("BOTTOMPADDING", (0,0), (-1,-1), 7)]))
+    story.extend([Paragraph("Fahrzeugdaten", styles["Heading2"]), vehicle_table, Spacer(1, 7*mm), Paragraph("Wartungshistorie", styles["Heading2"])])
+
+    work_labels = {
+        "engine_oil": "Motoröl", "oil_filter": "Ölfilter", "spark_plugs": "Zündkerzen",
+        "air_filter": "Luftfilter", "cabin_filter": "Innenraumfilter", "timing_belt": "Zahnriemen",
+        "brake_fluid": "Bremsflüssigkeit", "coolant": "Kühlmittel", "transmission_oil": "Getriebeöl"
+    }
+    if not services:
+        story.append(Paragraph("Keine Wartungen erfasst.", styles["BodyText"]))
+    for service in services:
+        heading = f"{service.date.strftime('%d.%m.%Y') if service.date else 'Ohne Datum'} – {escape(service.service_type or 'Wartung')}"
+        details = []
+        if service.mileage is not None: details.append(f"Kilometerstand: {service.mileage} km")
+        if service.workshop: details.append(f"Werkstatt: {escape(service.workshop)}")
+        work_done = [label for field, label in work_labels.items() if getattr(service, field, False)]
+        if work_done: details.append("Arbeiten: " + ", ".join(work_done))
+        if service.notes: details.append("Notiz: " + escape(service.notes).replace("\n", "<br/>"))
+        if service.next_service_date: details.append(f"Nächste Wartung: {service.next_service_date.strftime('%d.%m.%Y')}")
+        if service.next_service_mileage is not None: details.append(f"Nächste Wartung bei: {service.next_service_mileage} km")
+        icon_cell = AttachmentIcon() if attachments_by_service.get(service.id) else ""
+        service_box = Table([[icon_cell, Paragraph(f"<b>{heading}</b>", styles["BodyText"])], ["", Paragraph("<br/>".join(details) if details else "Keine weiteren Angaben.", styles["SmallNote"])]], colWidths=[9*mm, 165*mm], hAlign="LEFT")
+        service_box.setStyle(TableStyle([("BOX", (0,0), (-1,-1), .6, colors.HexColor("#94a3b8")), ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#eff6ff")), ("VALIGN", (0,0), (-1,-1), "MIDDLE"), ("SPAN", (0,0), (0,1)), ("LEFTPADDING", (0,0), (-1,-1), 7), ("RIGHTPADDING", (0,0), (-1,-1), 7), ("TOPPADDING", (0,0), (-1,-1), 6), ("BOTTOMPADDING", (0,0), (-1,-1), 6)]))
+        story.extend([service_box, Spacer(1, 3*mm)])
+
+    ordered_attachments = sorted(attachments, key=lambda item: (service_by_id[item.service_id].date or date.min, str(item.created_at or ""), item.id), reverse=True)
+    story.extend([PageBreak(), Paragraph("Wartungsdokumente", styles["Heading1"])])
+    if not ordered_attachments:
+        story.append(Paragraph("Zu den Wartungen sind keine Dokumente angehängt.", styles["BodyText"]))
+    else:
+        story.append(Paragraph("Die Büroklammer markiert Wartungen mit Anlagen. Nach dieser Übersicht folgen die Originalseiten oder die eingebetteten Originaldateien.", styles["BodyText"]))
+        story.append(Spacer(1, 4*mm))
+        for attachment in ordered_attachments:
+            service = service_by_id[attachment.service_id]
+            service_date = service.date.strftime('%d.%m.%Y') if service.date else "Ohne Datum"
+            service_label = service.service_type or "Wartung"
+            rows = [[Paragraph(f"<b>{escape(attachment.title or attachment.filename)}</b><br/>Zugeordnet zu: {escape(service_date)} – {escape(service_label)}<br/>Datei: {escape(attachment.filename)}", styles["BodyText"])]]
+            item_table = Table(rows, colWidths=[174*mm], hAlign="LEFT")
+            item_table.setStyle(TableStyle([("BACKGROUND", (0,0), (-1,-1), colors.HexColor("#f8fafc")), ("BOX", (0,0), (-1,-1), .4, colors.HexColor("#cbd5e1")), ("LEFTPADDING", (0,0), (-1,-1), 8), ("RIGHTPADDING", (0,0), (-1,-1), 8), ("TOPPADDING", (0,0), (-1,-1), 7), ("BOTTOMPADDING", (0,0), (-1,-1), 7)]))
+            story.extend([item_table, Spacer(1, 3*mm)])
+
+    pdf.build(story)
+
+    # PDF- und Bilddateien werden sichtbar in den Bericht übernommen.
+    # Andere Originalformate werden als PDF-Dateianlage eingebettet.
+    from pypdf import PdfReader, PdfWriter
+    from reportlab.pdfgen import canvas
+    from reportlab.lib.utils import ImageReader
+
+    writer = PdfWriter()
+    report_reader = PdfReader(io.BytesIO(output.getvalue()))
+    for page in report_reader.pages:
+        writer.add_page(page)
+
+    def append_generated_pdf(pdf_bytes):
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+        for page in reader.pages:
+            writer.add_page(page)
+
+    for index, attachment in enumerate(ordered_attachments, start=1):
+        attachment_path = _attachment_path(attachment)
+        if not os.path.isfile(attachment_path):
+            continue
+        with open(attachment_path, "rb") as file_handle:
+            original_bytes = file_handle.read()
+
+        safe_attachment_name = re.sub(r"[^A-Za-z0-9._-]+", "_", attachment.filename or f"Anlage_{index}")
+        try:
+            writer.add_attachment(f"{index:02d}_{safe_attachment_name}", original_bytes)
+        except Exception:
+            app.logger.exception("PDF-Anlage konnte nicht eingebettet werden: %s", attachment.id)
+
+        file_type = (attachment.mime_type or "").lower()
+        extension = os.path.splitext(attachment.filename or "")[1].lower()
+        if file_type == "application/pdf" or extension == ".pdf":
+            try:
+                attached_reader = PdfReader(io.BytesIO(original_bytes))
+                if attached_reader.is_encrypted and not attached_reader.decrypt(""):
+                    raise ValueError("Das PDF ist verschlüsselt.")
+                for page in attached_reader.pages:
+                    writer.add_page(page)
+            except Exception:
+                app.logger.exception("PDF-Inhalt konnte nicht angefügt werden: %s", attachment.id)
+        elif file_type.startswith("image/") or extension in {".png", ".jpg", ".jpeg", ".gif", ".bmp"}:
+            try:
+                image = ImageReader(io.BytesIO(original_bytes))
+                image_width, image_height = image.getSize()
+                page_width, page_height = A4
+                max_width, max_height = page_width - 40*mm, page_height - 55*mm
+                scale = min(max_width / image_width, max_height / image_height)
+                draw_width, draw_height = image_width * scale, image_height * scale
+                image_buffer = io.BytesIO()
+                image_canvas = canvas.Canvas(image_buffer, pagesize=A4)
+                image_canvas.drawImage(image, (page_width-draw_width)/2, (page_height-draw_height)/2, width=draw_width, height=draw_height, preserveAspectRatio=True, mask="auto")
+                image_canvas.save()
+                append_generated_pdf(image_buffer.getvalue())
+            except Exception:
+                app.logger.exception("Bild konnte nicht als PDF-Seite eingebettet werden: %s", attachment.id)
+
+    merged_output = io.BytesIO()
+    writer.write(merged_output)
+    merged_output.seek(0)
+    safe_name = re.sub(r"[^A-Za-z0-9_-]+", "_", vehicle.name or "Fahrzeug").strip("_") or "Fahrzeug"
+    return send_file(merged_output, mimetype="application/pdf", as_attachment=True, download_name=f"{safe_name}_Wartungsbericht.pdf")
+
+
 @app.route("/api/attachments/<int:attachment_id>", methods=["DELETE"])
 @require_token
 def api_delete_attachment(attachment_id):
