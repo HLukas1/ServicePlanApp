@@ -1,6 +1,6 @@
 // ServicePlan Service Worker
 
-const CACHE_NAME = "serviceplan-shell-v8";
+const CACHE_NAME = "serviceplan-shell-v10";
 
 const SHELL_FILES = [
   "/",

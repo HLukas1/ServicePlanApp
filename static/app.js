@@ -8,7 +8,7 @@
 // ---------- IndexedDB ----------f
 
 const DB_NAME = "serviceplan";
-const DB_VERSION = 3;
+const DB_VERSION = 4;
 let dbPromise = null;
 
 function openDatabase() {
@@ -582,6 +582,12 @@ async function flushQueue() {
         await idbDelete(storeFor(item.kind), entityId);
 
         if (item.kind === "vehicle") {
+          // Nach dem ersten Server-Sync bekommt ein neues Fahrzeug eine
+          // numerische ID. Die Detailseite muss auf diese ID umgestellt werden.
+          const route = parseRoute();
+          if (route.name === "vehicle" && idEq(route.vehicleId, entityId)) {
+            location.hash = `#/vehicle/${created.id}`;
+          }
           for (const s of await idbGetAll("services")) {
             if (idEq(s.vehicle_id, entityId)) { s.vehicle_id = created.id; await idbPut("services", s); }
           }
@@ -611,6 +617,19 @@ async function pullSnapshot() {
   const data = await apiFetch("/api/sync");
 
   const queue = await idbGetAll("queue");
+  // Snapshot ersetzen, aber lokale Datensätze mit offenen Änderungen erhalten.
+  // Sonst verschwindet ein gerade offline angelegtes Fahrzeug beim Sync und
+  // die Detailansicht zeigt fälschlich „Fahrzeug nicht gefunden“.
+  const pendingRecords = [];
+  const pendingDeletes = [];
+  for (const item of queue) {
+    if (item.op === "delete") {
+      pendingDeletes.push({ store: storeFor(item.kind), id: item.entityId });
+    } else {
+      const record = await idbGetById(storeFor(item.kind), item.entityId);
+      if (record) pendingRecords.push({ store: storeFor(item.kind), record });
+    }
+  }
   const pendingAttachmentIds = queue
     .filter(q => q.kind === "attachment" && q.op === "create")
     .map(q => q.entityId);
@@ -644,7 +663,16 @@ async function pullSnapshot() {
     }
   }
 
+  for (const { store, id } of pendingDeletes) await idbDelete(store, id);
+  for (const { store, record } of pendingRecords) await idbPut(store, record);
+
   localStorage.setItem("lastSync", data.server_time);
+  updateLastSyncDisplay(data.server_time);
+}
+
+function updateLastSyncDisplay(value = localStorage.getItem("lastSync")) {
+  const display = document.getElementById("last-sync-time");
+  if (display) display.textContent = value ? new Date(value).toLocaleString("de-DE") : "nie";
 }
 
 async function sync({ rerender = true, manual = false } = {}) {
@@ -709,6 +737,7 @@ function parseRoute() {
   const segments = hash.split("/").filter(Boolean);
 
   if (segments[0] === "vehicle" && segments[1] === "add") return { name: "vehicle-add" };
+  if (segments[0] === "vehicle" && segments[2] === "costs") return { name: "vehicle-costs", vehicleId: segments[1] };
   if (segments[0] === "vehicle" && segments[2] === "edit") return { name: "vehicle-edit", vehicleId: segments[1] };
   if (segments[0] === "vehicle" && segments[2] === "service" && segments[3] === "add") return { name: "service-add", vehicleId: segments[1] };
   if (segments[0] === "vehicle" && segments[2] === "note" && segments[3] === "add") return { name: "note-add", vehicleId: segments[1] };
@@ -735,6 +764,7 @@ async function renderCurrentRoute() {
   try {
     switch (route.name) {
       case "vehicle": html = await renderVehicleDetailView(route.vehicleId); break;
+      case "vehicle-costs": html = await renderVehicleCostsView(route.vehicleId); break;
       case "vehicle-add": html = renderVehicleFormView(null); break;
       case "vehicle-edit": html = await renderVehicleFormViewAsync(route.vehicleId); break;
       case "service-add": html = await renderServiceFormView(route.vehicleId, null); break;
@@ -1025,6 +1055,8 @@ async function renderVehicleDetailView(vehicleId) {
         </div>
       </section>
 
+      <section class="card vehicle-costs-link"><div><h2 class="card-title">Fahrzeugkosten</h2><p class="subtitle">Wartungen, Versicherung, Steuer und Kaufpreis</p></div><a class="btn btn-primary" href="#/vehicle/${vehicle.id}/costs">Kosten</a></section>
+
       <section class="card">
         <div class="service-header"><h2 class="card-title">Bilder &amp; Dokumente</h2></div>
         <div class="upload-actions attachment-upload-actions">
@@ -1042,6 +1074,42 @@ async function renderVehicleDetailView(vehicleId) {
       ${services.length ? `<div class="stack">${serviceCards}</div>` : `<p class="empty-hint">Noch keine Wartungen vorhanden.</p>`}
 
     </main>`;
+}
+
+const euro = value => new Intl.NumberFormat("de-DE", { style: "currency", currency: "EUR" }).format(Number(value || 0));
+const monthNames = ["Jan", "Feb", "Mär", "Apr", "Mai", "Jun", "Jul", "Aug", "Sep", "Okt", "Nov", "Dez"];
+
+async function renderVehicleCostsView(vehicleId) {
+  const vehicle = await idbGetById("vehicles", vehicleId);
+  if (!vehicle) return renderErrorView(new Error("Fahrzeug nicht gefunden."));
+  const services = (await idbGetAll("services")).filter(s => idEq(s.vehicle_id, vehicleId) && s.cost != null && s.date);
+  const totals = new Map();
+  const add = (date, amount) => {
+    if (!date || !(Number(amount) > 0)) return;
+    const [year, month] = date.split("-").map(Number);
+    if (!year || !month) return;
+    if (!totals.has(year)) totals.set(year, Array(12).fill(0));
+    totals.get(year)[month - 1] += Number(amount);
+  };
+  services.forEach(s => add(s.date, s.cost));
+  if (vehicle.purchase_date) add(vehicle.purchase_date, vehicle.purchase_price);
+  const currentYear = new Date().getFullYear();
+  const oldest = Math.min(currentYear, ...Array.from(totals.keys()));
+  for (let year = oldest; year <= currentYear; year++) {
+    if (Number(vehicle.insurance_amount) > 0) {
+      for (let month = 1; month <= 12; month++) {
+        if (vehicle.insurance_frequency === "monthly" || month === Number(vehicle.insurance_due_month)) add(`${year}-${String(month).padStart(2, "0")}-01`, vehicle.insurance_amount);
+      }
+    }
+    if (Number(vehicle.tax_amount) > 0 && Number(vehicle.tax_due_month) > 0) add(`${year}-${String(vehicle.tax_due_month).padStart(2, "0")}-01`, vehicle.tax_amount);
+  }
+  const years = [...totals.keys()].sort((a, b) => b - a);
+  const overall = [...totals.values()].flat().reduce((a, b) => a + b, 0);
+  const sections = years.map(year => {
+    const months = totals.get(year); const sum = months.reduce((a, b) => a + b, 0); const max = Math.max(1, ...months);
+    return `<section class="card costs-year"><div class="service-header"><h2 class="card-title">${year}</h2><strong>${euro(sum)}</strong></div><div class="cost-chart" role="img" aria-label="Monatliche Fahrzeugkosten ${year}">${months.map((amount, i) => `<div class="cost-month"><span class="cost-value">${amount ? euro(amount) : ""}</span><div class="cost-bar-wrap"><div class="cost-bar" style="height:${amount ? Math.max(3, amount / max * 100) : 0}%"></div></div><span>${monthNames[i]}</span></div>`).join("")}</div></section>`;
+  }).join("");
+  return `${offlineBannerHtml()}${topbarHtml({ backHref: `#/vehicle/${vehicle.id}`, title: "Kostenübersicht", rightHref: null })}<main class="container container-narrow"><section class="card costs-total"><span>Gesamtkosten</span><strong>${euro(overall)}</strong><small>Wartungen, Kaufpreis, Versicherung und Steuer</small></section>${sections || `<div class="card empty-state"><h3>Noch keine Kosten erfasst</h3><p>Trage Kaufpreis, Versicherung und Steuer bei „Fahrzeug bearbeiten“ ein. Wartungskosten werden aus der Wartungshistorie übernommen.</p></div>`}</main>`;
 }
 
 // ---------- Fahrzeug-Formular ----------
@@ -1083,6 +1151,12 @@ function vehicleFormFields(v) {
       </div>
       <div class="field"><label for="f-fin">FIN / VIN</label><input id="f-fin" type="text" name="fin" value="${escapeHtml(v?.fin || "")}" placeholder="z.B. WAUZZZ281ZFA095461"></div>
       <div class="field"><label for="f-mileage">Kilometerstand</label><input id="f-mileage" type="number" name="mileage" value="${v?.mileage ?? ""}" placeholder="z.B. 380000"></div>
+    </div>
+    <div class="form-section"><h3 class="section-title">Kosten</h3>
+      <div class="field-row"><div class="field"><label for="f-purchase-price">Kaufpreis (€)</label><input id="f-purchase-price" type="number" step="0.01" min="0" name="purchase_price" value="${v?.purchase_price ?? ""}"></div><div class="field"><label for="f-purchase-date">Kaufdatum</label><input id="f-purchase-date" type="date" name="purchase_date" value="${v?.purchase_date || ""}"></div></div>
+      <div class="field-row"><div class="field"><label for="f-insurance">Versicherung (€)</label><input id="f-insurance" type="number" step="0.01" min="0" name="insurance_amount" value="${v?.insurance_amount ?? ""}"></div><div class="field"><label for="f-insurance-frequency">Zahlweise</label><select id="f-insurance-frequency" name="insurance_frequency"><option value="yearly" ${v?.insurance_frequency !== "monthly" ? "selected" : ""}>Jährlich</option><option value="monthly" ${v?.insurance_frequency === "monthly" ? "selected" : ""}>Monatlich</option></select></div></div>
+      <div class="field"><label for="f-insurance-month">Fälligkeitsmonat Versicherung (jährlich)</label><select id="f-insurance-month" name="insurance_due_month"><option value="">Monat auswählen</option>${monthNames.map((m, i) => `<option value="${i + 1}" ${Number(v?.insurance_due_month) === i + 1 ? "selected" : ""}>${m}</option>`).join("")}</select></div>
+      <div class="field-row"><div class="field"><label for="f-tax">Kfz-Steuer pro Jahr (€)</label><input id="f-tax" type="number" step="0.01" min="0" name="tax_amount" value="${v?.tax_amount ?? ""}"></div><div class="field"><label for="f-tax-month">Fälligkeitsmonat Steuer</label><select id="f-tax-month" name="tax_due_month"><option value="">Monat auswählen</option>${monthNames.map((m, i) => `<option value="${i + 1}" ${Number(v?.tax_due_month) === i + 1 ? "selected" : ""}>${m}</option>`).join("")}</select></div></div>
     </div>`;
 }
 
@@ -1269,7 +1343,7 @@ async function renderSettingsView() {
 
           <p class="card-text">
             ${pending} ungesendete Änderung${pending === 1 ? "" : "en"} ·
-            Letzter Sync: ${lastSync ? new Date(lastSync).toLocaleString("de-DE") : "nie"}
+            Letzter Sync: <span id="last-sync-time">${lastSync ? new Date(lastSync).toLocaleString("de-DE") : "nie"}</span>
           </p>
           <div class="form-buttons">
             <button type="button" class="btn btn-primary" id="manual-sync-btn">Jetzt synchronisieren</button>
@@ -1475,7 +1549,10 @@ function bindVehicleForm() {
     const fields = {
       name: raw.name, brand: raw.brand || null, model: raw.model || null,
       engine: raw.engine || null, year: numOrNull(raw.year), color: raw.color || null,
-      license_plate: raw.license_plate || null, mileage: numOrNull(raw.mileage), fin: raw.fin || null
+      license_plate: raw.license_plate || null, mileage: numOrNull(raw.mileage), fin: raw.fin || null,
+      purchase_price: numOrNull(raw.purchase_price), purchase_date: raw.purchase_date || null,
+      insurance_amount: numOrNull(raw.insurance_amount), insurance_frequency: raw.insurance_frequency,
+      insurance_due_month: numOrNull(raw.insurance_due_month), tax_amount: numOrNull(raw.tax_amount), tax_due_month: numOrNull(raw.tax_due_month)
     };
 
     if (form.dataset.mode === "edit") {
