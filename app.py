@@ -109,6 +109,13 @@ class Vehicle(db.Model):
     mileage = db.Column(db.Integer)
     fin = db.Column(db.String(50))
     photo_attachment_id = db.Column(db.Integer, nullable=True)
+    purchase_price = db.Column(db.Numeric(10, 2))
+    purchase_date = db.Column(db.Date)
+    insurance_amount = db.Column(db.Numeric(10, 2))
+    insurance_frequency = db.Column(db.String(10), nullable=False, default="yearly")
+    insurance_due_month = db.Column(db.Integer)
+    tax_amount = db.Column(db.Numeric(10, 2))
+    tax_due_month = db.Column(db.Integer)
 
     services = db.relationship(
         "Service",
@@ -136,7 +143,14 @@ class Vehicle(db.Model):
             "license_plate": self.license_plate,
             "mileage": self.mileage,
             "fin": self.fin,
-            "photo_attachment_id": self.photo_attachment_id
+            "photo_attachment_id": self.photo_attachment_id,
+            "purchase_price": float(self.purchase_price) if self.purchase_price is not None else None,
+            "purchase_date": self.purchase_date.isoformat() if self.purchase_date else None,
+            "insurance_amount": float(self.insurance_amount) if self.insurance_amount is not None else None,
+            "insurance_frequency": self.insurance_frequency or "yearly",
+            "insurance_due_month": self.insurance_due_month,
+            "tax_amount": float(self.tax_amount) if self.tax_amount is not None else None,
+            "tax_due_month": self.tax_due_month
         }
 
         if full:
@@ -228,6 +242,7 @@ class Attachment(db.Model):
     service_id = db.Column(db.Integer, db.ForeignKey("service.id"), nullable=True, index=True)
     note_id = db.Column(db.Integer, db.ForeignKey("note.id"), nullable=True, index=True)
     filename = db.Column(db.String(255), nullable=False)
+    title = db.Column(db.String(255))
     stored_filename = db.Column(db.String(255), nullable=False, unique=True)
     mime_type = db.Column(db.String(120), nullable=False)
     file_size = db.Column(db.Integer, nullable=False, default=0)
@@ -241,6 +256,7 @@ class Attachment(db.Model):
             "service_id": self.service_id,
             "note_id": self.note_id,
             "filename": self.filename,
+            "title": self.title or self.filename,
             "mime_type": self.mime_type,
             "file_size": self.file_size,
             "is_vehicle_image": bool(self.is_vehicle_image),
@@ -339,7 +355,9 @@ def api_sync():
 
 VEHICLE_FIELDS = [
     "name", "brand", "model", "engine", "year",
-    "color", "license_plate", "mileage", "fin", "photo_attachment_id"
+    "color", "license_plate", "mileage", "fin", "photo_attachment_id",
+    "purchase_price", "purchase_date", "insurance_amount", "insurance_frequency",
+    "insurance_due_month", "tax_amount", "tax_due_month"
 ]
 
 
@@ -352,9 +370,10 @@ def api_create_vehicle():
     if not data.get("name"):
         return jsonify({"error": "Name ist erforderlich."}), 400
 
-    vehicle = Vehicle(**{
-        field: data.get(field) for field in VEHICLE_FIELDS
-    })
+    values = {field: data.get(field) for field in VEHICLE_FIELDS}
+    if values.get("purchase_date"):
+        values["purchase_date"] = date.fromisoformat(values["purchase_date"])
+    vehicle = Vehicle(**values)
 
     db.session.add(vehicle)
     db.session.commit()
@@ -371,7 +390,10 @@ def api_update_vehicle(vehicle_id):
 
     for field in VEHICLE_FIELDS:
         if field in data:
-            setattr(vehicle, field, data[field])
+            value = data[field]
+            if field == "purchase_date" and value:
+                value = date.fromisoformat(value)
+            setattr(vehicle, field, value)
 
     db.session.commit()
 
@@ -612,6 +634,7 @@ def api_create_attachment():
         service_id=service_id,
         note_id=note_id,
         filename=_safe_filename(file.filename),
+        title=_safe_filename(request.form.get("title") or file.filename),
         stored_filename=stored_filename,
         mime_type=file.mimetype or "application/octet-stream",
         file_size=size,
@@ -682,6 +705,13 @@ def api_export():
             "kennzeichen": vehicle.license_plate,
             "fin": vehicle.fin,
             "photoAttachmentId": str(vehicle.photo_attachment_id) if vehicle.photo_attachment_id is not None else None,
+            "purchasePrice": float(vehicle.purchase_price) if vehicle.purchase_price is not None else None,
+            "purchaseDate": vehicle.purchase_date.isoformat() if vehicle.purchase_date else None,
+            "insuranceAmount": float(vehicle.insurance_amount) if vehicle.insurance_amount is not None else None,
+            "insuranceFrequency": vehicle.insurance_frequency,
+            "insuranceDueMonth": vehicle.insurance_due_month,
+            "taxAmount": float(vehicle.tax_amount) if vehicle.tax_amount is not None else None,
+            "taxDueMonth": vehicle.tax_due_month,
         })
 
     maintenances_data = []
@@ -731,6 +761,7 @@ def api_export():
             "serviceId": str(attachment.service_id) if attachment.service_id is not None else None,
             "noteId": str(attachment.note_id) if attachment.note_id is not None else None,
             "filename": attachment.filename,
+            "title": attachment.title or attachment.filename,
             "mimeType": attachment.mime_type,
             "fileSize": attachment.file_size,
             "isVehicleImage": bool(attachment.is_vehicle_image),
@@ -833,7 +864,14 @@ def api_import():
             color=old_vehicle.get("farbe"),
             license_plate=old_vehicle.get("kennzeichen"),
             mileage=old_vehicle.get("kmStand"),
-            fin=old_vehicle.get("fin")
+            fin=old_vehicle.get("fin"),
+            purchase_price=old_vehicle.get("purchasePrice"),
+            purchase_date=date.fromisoformat(old_vehicle["purchaseDate"]) if old_vehicle.get("purchaseDate") else None,
+            insurance_amount=old_vehicle.get("insuranceAmount"),
+            insurance_frequency=old_vehicle.get("insuranceFrequency") or "yearly",
+            insurance_due_month=old_vehicle.get("insuranceDueMonth"),
+            tax_amount=old_vehicle.get("taxAmount"),
+            tax_due_month=old_vehicle.get("taxDueMonth")
         )
         db.session.add(vehicle)
         db.session.flush()
@@ -919,6 +957,7 @@ def api_import():
             service_id=new_service_id,
             note_id=new_note_id,
             filename=old_attachment.get("filename") or "Datei",
+            title=old_attachment.get("title") or old_attachment.get("filename") or "Datei",
             stored_filename=stored_filename,
             mime_type=old_attachment.get("mimeType") or "application/octet-stream",
             file_size=os.path.getsize(destination),
@@ -973,10 +1012,21 @@ with app.app_context():
 
     # Kleine, rückwärtskompatible Migration für bestehende Installationen.
     from sqlalchemy import inspect, text
+    attachment_columns = {c["name"] for c in inspect(db.engine).get_columns("attachment")}
+    if "title" not in attachment_columns:
+        db.session.execute(text("ALTER TABLE attachment ADD COLUMN title VARCHAR(255)"))
+        db.session.commit()
     inspector = inspect(db.engine)
     vehicle_columns = {c["name"] for c in inspector.get_columns("vehicle")}
-    if "photo_attachment_id" not in vehicle_columns:
-        db.session.execute(text("ALTER TABLE vehicle ADD COLUMN photo_attachment_id INTEGER"))
+    migrations = {
+        "photo_attachment_id": "INTEGER",
+        "purchase_price": "NUMERIC(10, 2)", "purchase_date": "DATE",
+        "insurance_amount": "NUMERIC(10, 2)", "insurance_frequency": "VARCHAR(10) NOT NULL DEFAULT 'yearly'",
+        "insurance_due_month": "INTEGER", "tax_amount": "NUMERIC(10, 2)", "tax_due_month": "INTEGER"
+    }
+    for column, sql_type in migrations.items():
+        if column not in vehicle_columns:
+            db.session.execute(text(f"ALTER TABLE vehicle ADD COLUMN {column} {sql_type}"))
         db.session.commit()
     db.create_all()
 
