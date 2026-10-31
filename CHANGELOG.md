@@ -8,6 +8,7 @@
 - Neues Feld „HU / TÜV fällig am“ am Fahrzeug (inkl. Backup, Import und PDF-Export).
 - Wird eine Wartung vom Typ „TÜV“ mit Datum für die nächste Wartung gespeichert, wird der HU-Termin am Fahrzeug automatisch übernommen.
 - Bestehende Datenbanken erhalten die neue Spalte beim Start automatisch.
+- Schwellen für „bald fällig“ (Tage für Wartungen, km für Wartungen, Tage für HU/TÜV) sind in den Einstellungen anpassbar, werden auf dem Server gespeichert und gelten für alle Geräte. Standard: 30 Tage, 1.000 km, 60 Tage.
 - Updates kommen auf Handy und Browser automatisch an, ohne Browserdaten zu löschen: Startseite wird immer zuerst vom Server geladen, `app.js`/`style.css` tragen eine Versionskennung.
 
 ## 7.0.0

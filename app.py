@@ -255,6 +255,54 @@ class Note(db.Model):
         }
 
 
+class Setting(db.Model):
+
+    key = db.Column(db.String(100), primary_key=True)
+    value = db.Column(db.Text)
+
+
+# Einstellbare Schwellen für „bald fällig“ (Standardwert, Minimum, Maximum).
+DUE_SETTING_LIMITS = {
+    "due_soon_days": (30, 0, 365),
+    "due_soon_days_hu": (60, 0, 365),
+    "due_soon_km": (1000, 0, 100000),
+}
+
+
+def get_app_settings():
+    stored = {s.key: s.value for s in Setting.query.all()}
+    result = {}
+    for key, (default, minimum, maximum) in DUE_SETTING_LIMITS.items():
+        try:
+            value = int(stored.get(key, default))
+        except (TypeError, ValueError):
+            value = default
+        result[key] = min(max(value, minimum), maximum)
+    return result
+
+
+def apply_app_settings(data):
+    """Übernimmt gültige Werte aus data. Gibt eine Fehlermeldung oder None zurück."""
+    if not isinstance(data, dict):
+        return "Ungültige Einstellungen."
+    values = {}
+    for key, (_default, minimum, maximum) in DUE_SETTING_LIMITS.items():
+        if key not in data:
+            continue
+        try:
+            value = int(data[key])
+        except (TypeError, ValueError):
+            return f"{key} muss eine ganze Zahl sein."
+        if not minimum <= value <= maximum:
+            return f"{key} muss zwischen {minimum} und {maximum} liegen."
+        values[key] = value
+    for key, value in values.items():
+        setting = db.session.get(Setting, key) or Setting(key=key)
+        setting.value = str(value)
+        db.session.add(setting)
+    return None
+
+
 class Attachment(db.Model):
 
     id = db.Column(db.Integer, primary_key=True)
@@ -371,8 +419,30 @@ def api_sync():
 
     return jsonify({
         "server_time": datetime.now(timezone.utc).isoformat(),
-        "vehicles": [v.to_dict(full=True) for v in vehicles]
+        "vehicles": [v.to_dict(full=True) for v in vehicles],
+        "settings": get_app_settings()
     })
+
+
+# ============================================================
+# API: Einstellungen
+# ============================================================
+
+@app.route("/api/settings", methods=["GET"])
+@require_token
+def api_get_settings():
+    return jsonify(get_app_settings())
+
+
+@app.route("/api/settings", methods=["PUT"])
+@require_token
+def api_update_settings():
+    data = request.get_json(force=True, silent=True)
+    error = apply_app_settings(data)
+    if error:
+        return jsonify({"error": error}), 400
+    db.session.commit()
+    return jsonify(get_app_settings())
 
 
 # ============================================================
@@ -977,6 +1047,7 @@ def api_export():
         "maintenances": maintenances_data,
         "notes": notes_data,
         "attachments": attachments_data,
+        "settings": get_app_settings(),
     }
 
     buffer = io.BytesIO()
@@ -1187,6 +1258,9 @@ def api_import():
             vehicle = db.session.get(Vehicle, new_vehicle_id)
             if vehicle:
                 vehicle.photo_attachment_id = new_photo_id
+
+    if isinstance(data.get("settings"), dict):
+        apply_app_settings(data["settings"])
 
     db.session.commit()
 

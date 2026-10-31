@@ -551,6 +551,13 @@ async function flushQueue() {
 
     if (item.op === "update" && String(entityId).startsWith("tmp-")) break;
 
+    if (item.kind === "settings") {
+      const saved = await apiFetch("/api/settings", { method: "PUT", body: payload });
+      storeDueSettings(saved);
+      await idbDelete("queue", item.localId);
+      continue;
+    }
+
     if (item.kind === "attachment" && item.op === "create") {
       const localAttachment = await idbGetById("attachments", item.entityId);
       if (!localAttachment?.blob) break;
@@ -627,9 +634,14 @@ async function pullSnapshot() {
   // Snapshot ersetzen, aber lokale Datensätze mit offenen Änderungen erhalten.
   // Sonst verschwindet ein gerade offline angelegtes Fahrzeug beim Sync und
   // die Detailansicht zeigt fälschlich „Fahrzeug nicht gefunden“.
+  if (data.settings && !queue.some(item => item.kind === "settings")) {
+    storeDueSettings(data.settings);
+  }
+
   const pendingRecords = [];
   const pendingDeletes = [];
   for (const item of queue) {
+    if (item.kind === "settings") continue;
     if (item.op === "delete") {
       pendingDeletes.push({ store: storeFor(item.kind), id: item.entityId });
     } else {
@@ -900,9 +912,38 @@ function renderErrorView(err) {
 
 // ---------- Fälligkeiten ----------
 
-const DUE_SOON_DAYS = 30;
-const DUE_SOON_DAYS_HU = 60;
-const DUE_SOON_KM = 1000;
+// Standardwerte für „bald fällig“. Eigene Werte werden in den Einstellungen
+// gesetzt, auf dem Server gespeichert und lokal für den Offline-Betrieb vorgehalten.
+const DUE_SETTING_DEFAULTS = { due_soon_days: 30, due_soon_days_hu: 60, due_soon_km: 1000 };
+const DUE_SETTING_LIMITS = { due_soon_days: [0, 365], due_soon_days_hu: [0, 365], due_soon_km: [0, 100000] };
+
+function getDueSettings() {
+  let stored = {};
+  try { stored = JSON.parse(localStorage.getItem("dueSettings") || "{}") || {}; } catch (_) { stored = {}; }
+  const result = {};
+  for (const [key, def] of Object.entries(DUE_SETTING_DEFAULTS)) {
+    const value = Number(stored[key]);
+    const [min, max] = DUE_SETTING_LIMITS[key];
+    result[key] = Number.isInteger(value) && value >= min && value <= max ? value : def;
+  }
+  return result;
+}
+
+function storeDueSettings(settings) {
+  try { localStorage.setItem("dueSettings", JSON.stringify(settings)); } catch (_) {}
+}
+
+async function saveDueSettings(settings) {
+  storeDueSettings(settings);
+  // Ältere, noch nicht gesendete Einstellungsänderungen ersetzen.
+  for (const item of await idbGetAll("queue")) {
+    if (item.kind === "settings") await idbDelete("queue", item.localId);
+  }
+  await enqueue("settings", "update", "settings", settings);
+  // Ohne Neuaufbau der Seite synchronisieren, damit die Bestätigung sichtbar bleibt.
+  return sync({ rerender: false });
+}
+
 const DUE_RANK = { overdue: 0, soon: 1, ok: 2 };
 
 function todayIso() {
@@ -937,11 +978,11 @@ function worstStatus(statuses) {
 // Ermittelt alle anstehenden Termine eines Fahrzeugs.
 // Pro Wartungsart zählt nur die jüngste Wartung mit Angabe zur nächsten Wartung,
 // ältere Vorgaben sind damit erledigt.
-function computeDueItems(vehicle, services) {
+function computeDueItems(vehicle, services, settings = getDueSettings()) {
   const items = [];
 
   if (vehicle.hu_due_date) {
-    const d = dateDueStatus(vehicle.hu_due_date, DUE_SOON_DAYS_HU);
+    const d = dateDueStatus(vehicle.hu_due_date, settings.due_soon_days_hu);
     items.push({
       vehicle, kind: "hu", title: "HU / TÜV", status: d.status,
       detail: `${formatDateDisplay(vehicle.hu_due_date)} · ${d.text}`,
@@ -964,7 +1005,7 @@ function computeDueItems(vehicle, services) {
     let sortKey = Infinity;
 
     if (s.next_service_date) {
-      const d = dateDueStatus(s.next_service_date, DUE_SOON_DAYS);
+      const d = dateDueStatus(s.next_service_date, settings.due_soon_days);
       statuses.push(d.status);
       parts.push(`${formatDateDisplay(s.next_service_date)} · ${d.text}`);
       sortKey = Math.min(sortKey, d.days);
@@ -974,7 +1015,7 @@ function computeDueItems(vehicle, services) {
       const target = Number(s.next_service_mileage);
       if (vehicle.mileage != null && vehicle.mileage !== "") {
         const remaining = target - Number(vehicle.mileage);
-        const status = remaining <= 0 ? "overdue" : remaining <= DUE_SOON_KM ? "soon" : "ok";
+        const status = remaining <= 0 ? "overdue" : remaining <= settings.due_soon_km ? "soon" : "ok";
         statuses.push(status);
         parts.push(remaining <= 0
           ? `bei ${formatKm(target)} · ${formatKm(-remaining)} drüber`
@@ -1017,8 +1058,9 @@ async function renderVehicleListView() {
   const vehicles = (await idbGetAll("vehicles")).sort((a, b) => (a.name || "").localeCompare(b.name || ""));
   const allServices = await idbGetAll("services");
 
+  const dueSettings = getDueSettings();
   const dueByVehicle = new Map(vehicles.map(v => [
-    String(v.id), computeDueItems(v, allServices.filter(s => idEq(s.vehicle_id, v.id)))
+    String(v.id), computeDueItems(v, allServices.filter(s => idEq(s.vehicle_id, v.id)), dueSettings)
   ]));
   const pendingDue = [...dueByVehicle.values()].flat()
     .filter(i => i.status !== "ok")
@@ -1313,7 +1355,7 @@ function vehicleFormFields(v) {
       <div class="field">
         <label for="f-hu-due">Nächste HU / TÜV fällig am</label>
         <input id="f-hu-due" type="date" name="hu_due_date" value="${v?.hu_due_date || ""}">
-        <p class="field-hint">Steht auf der Plakette (Monat/Jahr) bzw. im Prüfbericht. Ab ${DUE_SOON_DAYS_HU} Tagen vorher erscheint ein Hinweis auf der Startseite.</p>
+        <p class="field-hint">Steht auf der Plakette (Monat/Jahr) bzw. im Prüfbericht. Ab ${getDueSettings().due_soon_days_hu} Tagen vorher erscheint ein Hinweis auf der Startseite (in den Einstellungen änderbar).</p>
       </div>
     </div>
     <div class="form-section"><h3 class="section-title">Kosten</h3>
@@ -1494,6 +1536,7 @@ async function renderSettingsView() {
   const pending = (await idbGetAll("queue")).length;
   const vehicles = (await idbGetAll("vehicles")).sort((a, b) => (a.name || "").localeCompare(b.name || ""));
   const lastSync = localStorage.getItem("lastSync");
+  const dueSettings = getDueSettings();
 
   return `${offlineBannerHtml()}
     ${topbarHtml({ backHref: "#/", title: "Einstellungen", icon: "⚙️", rightHref: null })}
@@ -1515,6 +1558,24 @@ async function renderSettingsView() {
             <button type="button" class="btn btn-primary" id="manual-sync-btn">Jetzt synchronisieren</button>
           <div id="manual-sync-result" class="sync-result" aria-live="polite"></div>
           </div>
+        </div>
+
+        <div class="card">
+          <h3 class="card-title">Fälligkeiten</h3>
+          <p class="card-text">Ab wann ein Termin auf der Startseite als „bald fällig“ angezeigt wird. Überfällig ist ein Termin immer ab dem Tag nach dem Fälligkeitsdatum bzw. sobald der Kilometerstand erreicht ist.</p>
+          <form id="due-settings-form">
+            <div class="field-row">
+              <div class="field"><label for="due-soon-days">Wartung nach Datum (Tage vorher)</label><input id="due-soon-days" type="number" inputmode="numeric" min="0" max="365" step="1" name="due_soon_days" value="${dueSettings.due_soon_days}" required></div>
+              <div class="field"><label for="due-soon-km">Wartung nach km (km vorher)</label><input id="due-soon-km" type="number" inputmode="numeric" min="0" max="100000" step="1" name="due_soon_km" value="${dueSettings.due_soon_km}" required></div>
+            </div>
+            <div class="field"><label for="due-soon-days-hu">HU / TÜV (Tage vorher)</label><input id="due-soon-days-hu" type="number" inputmode="numeric" min="0" max="365" step="1" name="due_soon_days_hu" value="${dueSettings.due_soon_days_hu}" required></div>
+            <p class="field-hint">Standard: ${DUE_SETTING_DEFAULTS.due_soon_days} Tage · ${new Intl.NumberFormat("de-DE").format(DUE_SETTING_DEFAULTS.due_soon_km)} km · HU/TÜV ${DUE_SETTING_DEFAULTS.due_soon_days_hu} Tage. Gilt für alle verbundenen Geräte.</p>
+            <div class="form-buttons">
+              <button type="submit" class="btn btn-primary">Speichern</button>
+              <button type="button" class="btn btn-secondary" id="due-settings-reset">Standardwerte</button>
+            </div>
+            <div id="due-settings-result" class="sync-result" aria-live="polite"></div>
+          </form>
         </div>
 
         <div class="card">
@@ -1850,6 +1911,34 @@ function bindSettings() {
     updateServerStatus();
   }, 10000);
 
+  const dueForm = document.getElementById("due-settings-form");
+  const dueResult = document.getElementById("due-settings-result");
+  dueForm?.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const raw = readFormData(dueForm);
+    const settings = {};
+    for (const key of Object.keys(DUE_SETTING_DEFAULTS)) {
+      const value = Number(raw[key]);
+      const [min, max] = DUE_SETTING_LIMITS[key];
+      if (!Number.isInteger(value) || value < min || value > max) {
+        if (dueResult) dueResult.textContent = `Bitte ganze Zahlen zwischen ${min} und ${max} eingeben.`;
+        return;
+      }
+      settings[key] = value;
+    }
+    const status = await saveDueSettings(settings);
+    if (dueResult) dueResult.textContent = status === "ok"
+      ? "Gespeichert."
+      : "Auf diesem Gerät gespeichert – wird an den Server übertragen, sobald wieder Verbindung besteht.";
+  });
+  document.getElementById("due-settings-reset")?.addEventListener("click", () => {
+    for (const [key, value] of Object.entries(DUE_SETTING_DEFAULTS)) {
+      const input = dueForm?.querySelector(`[name="${key}"]`);
+      if (input) input.value = value;
+    }
+    dueForm?.requestSubmit();
+  });
+
   document.getElementById("pdf-export-btn")?.addEventListener("click", async (event) => {
     const btn = event.currentTarget;
     const vehicleSelect = document.getElementById("pdf-vehicle-select");
@@ -1967,6 +2056,7 @@ function bindSettings() {
     await idbClear("queue");
     localStorage.removeItem("apiToken");
     localStorage.removeItem("lastSync");
+    localStorage.removeItem("dueSettings");
     location.hash = "#/";
     await renderCurrentRoute();
   });
