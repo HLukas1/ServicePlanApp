@@ -116,6 +116,7 @@ class Vehicle(db.Model):
     insurance_due_month = db.Column(db.Integer)
     tax_amount = db.Column(db.Numeric(10, 2))
     tax_due_month = db.Column(db.Integer)
+    hu_due_date = db.Column(db.Date)
 
     services = db.relationship(
         "Service",
@@ -150,7 +151,8 @@ class Vehicle(db.Model):
             "insurance_frequency": self.insurance_frequency or "yearly",
             "insurance_due_month": self.insurance_due_month,
             "tax_amount": float(self.tax_amount) if self.tax_amount is not None else None,
-            "tax_due_month": self.tax_due_month
+            "tax_due_month": self.tax_due_month,
+            "hu_due_date": self.hu_due_date.isoformat() if self.hu_due_date else None
         }
 
         if full:
@@ -357,8 +359,10 @@ VEHICLE_FIELDS = [
     "name", "brand", "model", "engine", "year",
     "color", "license_plate", "mileage", "fin", "photo_attachment_id",
     "purchase_price", "purchase_date", "insurance_amount", "insurance_frequency",
-    "insurance_due_month", "tax_amount", "tax_due_month"
+    "insurance_due_month", "tax_amount", "tax_due_month", "hu_due_date"
 ]
+
+VEHICLE_DATE_FIELDS = {"purchase_date", "hu_due_date"}
 
 
 @app.route("/api/vehicles", methods=["POST"])
@@ -371,8 +375,8 @@ def api_create_vehicle():
         return jsonify({"error": "Name ist erforderlich."}), 400
 
     values = {field: data.get(field) for field in VEHICLE_FIELDS}
-    if values.get("purchase_date"):
-        values["purchase_date"] = date.fromisoformat(values["purchase_date"])
+    for field in VEHICLE_DATE_FIELDS:
+        values[field] = date.fromisoformat(values[field]) if values.get(field) else None
     vehicle = Vehicle(**values)
 
     db.session.add(vehicle)
@@ -391,8 +395,8 @@ def api_update_vehicle(vehicle_id):
     for field in VEHICLE_FIELDS:
         if field in data:
             value = data[field]
-            if field == "purchase_date" and value:
-                value = date.fromisoformat(value)
+            if field in VEHICLE_DATE_FIELDS:
+                value = date.fromisoformat(value) if value else None
             setattr(vehicle, field, value)
 
     db.session.commit()
@@ -715,14 +719,15 @@ def api_export_vehicle_pdf(vehicle_id):
     vehicle_info = [
         ("Marke", vehicle.brand), ("Modell", vehicle.model), ("Motor", vehicle.engine), ("Baujahr", vehicle.year),
         ("Farbe", vehicle.color), ("Kennzeichen", vehicle.license_plate), ("FIN / VIN", vehicle.fin),
-        ("Kilometerstand", f"{vehicle.mileage} km" if vehicle.mileage is not None else None)
+        ("Kilometerstand", f"{vehicle.mileage} km" if vehicle.mileage is not None else None),
+        ("HU / TÜV fällig", vehicle.hu_due_date.strftime("%d.%m.%Y") if vehicle.hu_due_date else None), ("", "")
     ]
     vehicle_rows = []
     for idx in range(0, len(vehicle_info), 2):
         left, right = vehicle_info[idx], vehicle_info[idx + 1]
         vehicle_rows.append([
             Paragraph(f"<b>{escape(left[0])}</b><br/>{escape(str(left[1] or '–'))}", styles["BodyText"]),
-            Paragraph(f"<b>{escape(right[0])}</b><br/>{escape(str(right[1] or '–'))}", styles["BodyText"])
+            Paragraph(f"<b>{escape(right[0])}</b><br/>{escape(str(right[1] or '–'))}" if right[0] else "", styles["BodyText"])
         ])
     vehicle_table = Table(vehicle_rows, colWidths=[87*mm, 87*mm], hAlign="LEFT")
     vehicle_table.setStyle(TableStyle([("BACKGROUND", (0,0), (-1,-1), colors.HexColor("#f3f4f6")), ("BOX", (0,0), (-1,-1), .4, colors.HexColor("#d1d5db")), ("INNERGRID", (0,0), (-1,-1), .3, colors.HexColor("#d1d5db")), ("VALIGN", (0,0), (-1,-1), "TOP"), ("LEFTPADDING", (0,0), (-1,-1), 8), ("RIGHTPADDING", (0,0), (-1,-1), 8), ("TOPPADDING", (0,0), (-1,-1), 7), ("BOTTOMPADDING", (0,0), (-1,-1), 7)]))
@@ -879,6 +884,7 @@ def api_export():
             "insuranceDueMonth": vehicle.insurance_due_month,
             "taxAmount": float(vehicle.tax_amount) if vehicle.tax_amount is not None else None,
             "taxDueMonth": vehicle.tax_due_month,
+            "huDueDate": vehicle.hu_due_date.isoformat() if vehicle.hu_due_date else None,
         })
 
     maintenances_data = []
@@ -1038,7 +1044,8 @@ def api_import():
             insurance_frequency=old_vehicle.get("insuranceFrequency") or "yearly",
             insurance_due_month=old_vehicle.get("insuranceDueMonth"),
             tax_amount=old_vehicle.get("taxAmount"),
-            tax_due_month=old_vehicle.get("taxDueMonth")
+            tax_due_month=old_vehicle.get("taxDueMonth"),
+            hu_due_date=date.fromisoformat(old_vehicle["huDueDate"]) if old_vehicle.get("huDueDate") else None
         )
         db.session.add(vehicle)
         db.session.flush()
@@ -1189,7 +1196,8 @@ with app.app_context():
         "photo_attachment_id": "INTEGER",
         "purchase_price": "NUMERIC(10, 2)", "purchase_date": "DATE",
         "insurance_amount": "NUMERIC(10, 2)", "insurance_frequency": "VARCHAR(10) NOT NULL DEFAULT 'yearly'",
-        "insurance_due_month": "INTEGER", "tax_amount": "NUMERIC(10, 2)", "tax_due_month": "INTEGER"
+        "insurance_due_month": "INTEGER", "tax_amount": "NUMERIC(10, 2)", "tax_due_month": "INTEGER",
+        "hu_due_date": "DATE"
     }
     for column, sql_type in migrations.items():
         if column not in vehicle_columns:

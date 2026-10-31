@@ -898,10 +898,148 @@ function renderErrorView(err) {
   </main>`;
 }
 
+// ---------- Fälligkeiten ----------
+
+const DUE_SOON_DAYS = 30;
+const DUE_SOON_DAYS_HU = 60;
+const DUE_SOON_KM = 1000;
+const DUE_RANK = { overdue: 0, soon: 1, ok: 2 };
+
+function todayIso() {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
+
+function daysUntil(iso) {
+  const [y, m, d] = iso.split("-").map(Number);
+  const [ty, tm, td] = todayIso().split("-").map(Number);
+  return Math.round((Date.UTC(y, m - 1, d) - Date.UTC(ty, tm - 1, td)) / 86400000);
+}
+
+function dateDueStatus(iso, soonDays) {
+  const days = daysUntil(iso);
+  const status = days < 0 ? "overdue" : days <= soonDays ? "soon" : "ok";
+  let text;
+  if (days < 0) text = `seit ${-days} Tag${days === -1 ? "" : "en"} überfällig`;
+  else if (days === 0) text = "heute fällig";
+  else text = `in ${days} Tag${days === 1 ? "" : "en"}`;
+  return { status, days, text };
+}
+
+function formatKm(value) {
+  return new Intl.NumberFormat("de-DE").format(Number(value)) + " km";
+}
+
+function worstStatus(statuses) {
+  return statuses.reduce((worst, s) => (DUE_RANK[s] < DUE_RANK[worst] ? s : worst), "ok");
+}
+
+// Ermittelt alle anstehenden Termine eines Fahrzeugs.
+// Pro Wartungsart zählt nur die jüngste Wartung mit Angabe zur nächsten Wartung,
+// ältere Vorgaben sind damit erledigt.
+function computeDueItems(vehicle, services) {
+  const items = [];
+
+  if (vehicle.hu_due_date) {
+    const d = dateDueStatus(vehicle.hu_due_date, DUE_SOON_DAYS_HU);
+    items.push({
+      vehicle, kind: "hu", title: "HU / TÜV", status: d.status,
+      detail: `${formatDateDisplay(vehicle.hu_due_date)} · ${d.text}`,
+      sortKey: d.days
+    });
+  }
+
+  const latestByType = new Map();
+  services
+    .filter(s => s.next_service_mileage || s.next_service_date)
+    .sort((a, b) => (b.date || "").localeCompare(a.date || ""))
+    .forEach(s => {
+      const type = s.service_type || "Wartung";
+      if (!latestByType.has(type)) latestByType.set(type, s);
+    });
+
+  for (const [type, s] of latestByType) {
+    const parts = [];
+    const statuses = [];
+    let sortKey = Infinity;
+
+    if (s.next_service_date) {
+      const d = dateDueStatus(s.next_service_date, DUE_SOON_DAYS);
+      statuses.push(d.status);
+      parts.push(`${formatDateDisplay(s.next_service_date)} · ${d.text}`);
+      sortKey = Math.min(sortKey, d.days);
+    }
+
+    if (s.next_service_mileage) {
+      const target = Number(s.next_service_mileage);
+      if (vehicle.mileage != null && vehicle.mileage !== "") {
+        const remaining = target - Number(vehicle.mileage);
+        const status = remaining <= 0 ? "overdue" : remaining <= DUE_SOON_KM ? "soon" : "ok";
+        statuses.push(status);
+        parts.push(remaining <= 0
+          ? `bei ${formatKm(target)} · ${formatKm(-remaining)} drüber`
+          : `bei ${formatKm(target)} · noch ${formatKm(remaining)}`);
+        // grobe Umrechnung, damit km-Termine sinnvoll zwischen Datums-Terminen einsortiert werden
+        sortKey = Math.min(sortKey, remaining / 50);
+      } else {
+        statuses.push("ok");
+        parts.push(`bei ${formatKm(target)}`);
+      }
+    }
+
+    items.push({
+      vehicle, kind: "service", serviceId: s.id, title: type,
+      status: worstStatus(statuses), detail: parts.join(" · "), sortKey
+    });
+  }
+
+  return items.sort((a, b) => DUE_RANK[a.status] - DUE_RANK[b.status] || a.sortKey - b.sortKey);
+}
+
+const DUE_LABELS = { overdue: "Überfällig", soon: "Bald fällig", ok: "OK" };
+
+function dueRowHtml(item, { showVehicle = false } = {}) {
+  const icon = item.kind === "hu" ? "🛡️" : "🔧";
+  const href = item.kind === "hu" ? `#/vehicle/${item.vehicle.id}/edit` : `#/vehicle/${item.vehicle.id}`;
+  return `<a class="due-row due-${item.status}" href="${href}">
+    <span class="due-icon">${icon}</span>
+    <span class="due-main">
+      <span class="due-title">${showVehicle ? `${escapeHtml(item.vehicle.name)} – ` : ""}${escapeHtml(item.title)}</span>
+      <span class="due-detail">${escapeHtml(item.detail)}</span>
+    </span>
+    <span class="due-badge">${DUE_LABELS[item.status]}</span>
+  </a>`;
+}
+
 // ---------- Fahrzeugliste ----------
 
 async function renderVehicleListView() {
   const vehicles = (await idbGetAll("vehicles")).sort((a, b) => (a.name || "").localeCompare(b.name || ""));
+  const allServices = await idbGetAll("services");
+
+  const dueByVehicle = new Map(vehicles.map(v => [
+    String(v.id), computeDueItems(v, allServices.filter(s => idEq(s.vehicle_id, v.id)))
+  ]));
+  const pendingDue = [...dueByVehicle.values()].flat()
+    .filter(i => i.status !== "ok")
+    .sort((a, b) => DUE_RANK[a.status] - DUE_RANK[b.status] || a.sortKey - b.sortKey);
+
+  const vehicleBadge = (v) => {
+    const items = dueByVehicle.get(String(v.id)) || [];
+    if (!items.length) return "";
+    const status = worstStatus(items.map(i => i.status));
+    const count = items.filter(i => i.status === status).length;
+    const label = status === "ok" ? "Alles OK" : `${count}× ${DUE_LABELS[status].toLowerCase()}`;
+    return `<span class="due-pill due-${status}">${label}</span>`;
+  };
+
+  const dueSection = vehicles.length ? `
+      <section class="card due-overview">
+        <div class="service-header"><h2 class="card-title">Was ist fällig?</h2></div>
+        ${pendingDue.length
+          ? `<div class="due-list">${pendingDue.map(i => dueRowHtml(i, { showVehicle: true })).join("")}</div>`
+          : `<p class="empty-hint due-all-ok">✅ Aktuell ist nichts überfällig oder bald fällig.</p>`}
+      </section>` : "";
 
   const cards = vehicles.map(v => `
     <a class="vehicle-card" href="#/vehicle/${v.id}">
@@ -911,6 +1049,7 @@ async function renderVehicleListView() {
           <h3>${escapeHtml(v.name)}</h3>
           <p class="vehicle-sub">${escapeHtml(v.brand || "")} ${escapeHtml(v.model || "")}</p>
         </div>
+        ${vehicleBadge(v)}
       </div>
       ${(v.engine || v.year || v.mileage) ? `
       <div class="vehicle-meta">
@@ -935,6 +1074,8 @@ async function renderVehicleListView() {
         <a class="btn btn-primary" href="#/vehicle/add">${iconPlus} Fahrzeug hinzufügen</a>
       </section>
 
+      ${dueSection}
+
       ${vehicles.length ? `<div class="vehicle-grid">${cards}</div>` : `
         <div class="empty-state">
           <div class="empty-icon">🚗</div>
@@ -957,6 +1098,7 @@ async function renderVehicleDetailView(vehicleId) {
     .sort((a, b) => (b.date || "").localeCompare(a.date || ""));
 
   const notes = (await idbGetAll("notes")).filter(n => idEq(n.vehicle_id, vehicleId));
+  const dueItems = computeDueItems(vehicle, services);
   const attachments = (await idbGetAll("attachments"))
     .filter(a => idEq(a.vehicle_id, vehicleId))
     .sort((a, b) => (b.created_at || "").localeCompare(a.created_at || ""));
@@ -1058,8 +1200,15 @@ async function renderVehicleDetailView(vehicleId) {
         <div class="service-header"><h2 class="card-title">Fahrzeugdaten</h2></div>
         <div class="info-grid">
           ${infoItem("Marke", vehicle.brand)}${infoItem("Modell", vehicle.model)}${infoItem("Motor", vehicle.engine)}${infoItem("Baujahr", vehicle.year)}
-          ${infoItem("Farbe", vehicle.color)}${infoItem("Kennzeichen", vehicle.license_plate)}${infoItem("FIN", vehicle.fin)}${infoItem("Kilometerstand", vehicle.mileage ? vehicle.mileage + " km" : "–")}
+          ${infoItem("Farbe", vehicle.color)}${infoItem("Kennzeichen", vehicle.license_plate)}${infoItem("FIN", vehicle.fin)}${infoItem("Kilometerstand", vehicle.mileage ? vehicle.mileage + " km" : "–")}${infoItem("HU / TÜV fällig", vehicle.hu_due_date ? formatDateDisplay(vehicle.hu_due_date) : "–")}
         </div>
+      </section>
+
+      <section class="card">
+        <div class="service-header"><h2 class="card-title">Termine</h2></div>
+        ${dueItems.length
+          ? `<div class="due-list">${dueItems.map(i => dueRowHtml(i)).join("")}</div>`
+          : `<p class="empty-hint">Keine Termine hinterlegt. Trage beim Fahrzeug den HU/TÜV-Termin oder bei einer Wartung die nächste Wartung ein.</p>`}
       </section>
 
       <section class="card vehicle-costs-link"><div><h2 class="card-title">Fahrzeugkosten</h2><p class="subtitle">Wartungen, Versicherung, Steuer und Kaufpreis</p></div><a class="btn btn-primary" href="#/vehicle/${vehicle.id}/costs">Kosten</a></section>
@@ -1158,6 +1307,14 @@ function vehicleFormFields(v) {
       </div>
       <div class="field"><label for="f-fin">FIN / VIN</label><input id="f-fin" type="text" name="fin" value="${escapeHtml(v?.fin || "")}" placeholder="z.B. WAUZZZ281ZFA095461"></div>
       <div class="field"><label for="f-mileage">Kilometerstand</label><input id="f-mileage" type="number" name="mileage" value="${v?.mileage ?? ""}" placeholder="z.B. 380000"></div>
+    </div>
+    <div class="form-section">
+      <h3 class="section-title">HU / TÜV</h3>
+      <div class="field">
+        <label for="f-hu-due">Nächste HU / TÜV fällig am</label>
+        <input id="f-hu-due" type="date" name="hu_due_date" value="${v?.hu_due_date || ""}">
+        <p class="field-hint">Steht auf der Plakette (Monat/Jahr) bzw. im Prüfbericht. Ab ${DUE_SOON_DAYS_HU} Tagen vorher erscheint ein Hinweis auf der Startseite.</p>
+      </div>
     </div>
     <div class="form-section"><h3 class="section-title">Kosten</h3>
       <div class="field-row"><div class="field"><label for="f-purchase-price">Kaufpreis (€)</label><input id="f-purchase-price" type="number" step="0.01" min="0" name="purchase_price" value="${v?.purchase_price ?? ""}"></div><div class="field"><label for="f-purchase-date">Kaufdatum</label><input id="f-purchase-date" type="date" name="purchase_date" value="${v?.purchase_date || ""}"></div></div>
@@ -1259,6 +1416,7 @@ async function renderServiceFormView(vehicleId, serviceId) {
             <div class="field"><label for="s-next-mileage">Bei Kilometerstand</label><input id="s-next-mileage" type="number" name="next_service_mileage" value="${service?.next_service_mileage ?? ""}" placeholder="z.B. 395000"></div>
             <div class="field"><label for="s-next-date">Am Datum</label><input id="s-next-date" type="date" name="next_service_date" value="${service?.next_service_date || ""}"></div>
           </div>
+          <p class="field-hint">Bei Wartungsart „TÜV“ wird das Datum automatisch als nächster HU/TÜV-Termin am Fahrzeug übernommen.</p>
         </div>
 
         <div class="form-section">
@@ -1569,7 +1727,8 @@ function bindVehicleForm() {
       license_plate: raw.license_plate || null, mileage: numOrNull(raw.mileage), fin: raw.fin || null,
       purchase_price: numOrNull(raw.purchase_price), purchase_date: raw.purchase_date || null,
       insurance_amount: numOrNull(raw.insurance_amount), insurance_frequency: raw.insurance_frequency,
-      insurance_due_month: numOrNull(raw.insurance_due_month), tax_amount: numOrNull(raw.tax_amount), tax_due_month: numOrNull(raw.tax_due_month)
+      insurance_due_month: numOrNull(raw.insurance_due_month), tax_amount: numOrNull(raw.tax_amount), tax_due_month: numOrNull(raw.tax_due_month),
+      hu_due_date: raw.hu_due_date || null
     };
 
     if (form.dataset.mode === "edit") {
@@ -1621,6 +1780,12 @@ function bindServiceForm() {
         await updateService(serviceId, fields);
       } else {
         serviceId = await createService(vehicleId, fields);
+      }
+      if (fields.service_type === "TÜV" && fields.next_service_date) {
+        const vehicle = await idbGetById("vehicles", vehicleId);
+        if (vehicle && vehicle.hu_due_date !== fields.next_service_date) {
+          await updateVehicle(vehicle.id, { hu_due_date: fields.next_service_date });
+        }
       }
       await queueFormFiles(pendingFiles, vehicleId, { serviceId });
       location.hash = `#/vehicle/${vehicleId}`;
