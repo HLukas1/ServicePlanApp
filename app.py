@@ -6,6 +6,7 @@ import json
 import io
 import zipfile
 import re
+import hashlib
 
 from flask import (
     Flask,
@@ -22,6 +23,23 @@ from flask_sqlalchemy import SQLAlchemy
 
 
 app = Flask(__name__)
+
+
+# Versionskennung für app.js/style.css. Ändert sich der Inhalt (z.B. nach
+# einem Update), ändert sich die URL – Handy und Browser laden dann
+# automatisch die neue Datei statt einer alten Kopie aus dem Cache.
+def _compute_asset_version():
+    digest = hashlib.sha256()
+    for name in ("static/app.js", "static/style.css", "service-worker.js"):
+        try:
+            with open(os.path.join(app.root_path, name), "rb") as fh:
+                digest.update(fh.read())
+        except OSError:
+            pass
+    return digest.hexdigest()[:12]
+
+
+ASSET_VERSION = _compute_asset_version()
 
 # ============================================================
 # Sicherheits-Konfiguration
@@ -324,7 +342,9 @@ def handle_unexpected_error(error):
 
 @app.route("/service-worker.js")
 def service_worker():
-    return send_from_directory(".", "service-worker.js", mimetype="application/javascript")
+    response = send_from_directory(app.root_path, "service-worker.js", mimetype="application/javascript")
+    response.headers["Cache-Control"] = "no-cache"
+    return response
 
 # ============================================================
 # PWA-Shell (statische Seite, keine Nutzdaten enthalten)
@@ -332,7 +352,11 @@ def service_worker():
 
 @app.route("/")
 def index():
-    return render_template("index.html")
+    response = app.make_response(render_template("index.html", asset_version=ASSET_VERSION))
+    # Die Startseite immer beim Server nachfragen, damit neue Versionen
+    # sofort ankommen. Offline liefert der Service Worker die gespeicherte Kopie.
+    response.headers["Cache-Control"] = "no-cache"
+    return response
 
 
 # ============================================================
