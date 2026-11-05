@@ -5,7 +5,7 @@
 - Neue Übersicht „Was ist fällig?“ auf der Startseite: überfällige und bald fällige Termine aller Fahrzeuge, farbig markiert.
 - Fahrzeugkarten zeigen einen Status (Alles OK / bald fällig / überfällig).
 - Neue Karte „Termine“ in der Fahrzeugansicht.
-- Neues Feld „HU / TÜV fällig am“ am Fahrzeug (inkl. Backup, Import und PDF-Export).
+- Neues Feld „Nächste HU“ am Fahrzeug – nur Monat und Jahr wie auf der Plakette, gültig bis Monatsende (inkl. Backup, Import und PDF-Export).
 - Wird eine Wartung vom Typ „TÜV“ mit Datum für die nächste Wartung gespeichert, wird der HU-Termin am Fahrzeug automatisch übernommen.
 - Bestehende Datenbanken erhalten die neue Spalte beim Start automatisch.
 - Schwellen für „bald fällig“ (Tage für Wartungen, km für Wartungen, Tage für HU/TÜV) sind in den Einstellungen anpassbar, werden auf dem Server gespeichert und gelten für alle Geräte. Standard: 30 Tage, 1.000 km, 60 Tage.

@@ -967,6 +967,18 @@ function dateDueStatus(iso, soonDays) {
   return { status, days, text };
 }
 
+// HU/TÜV wird nur mit Monat/Jahr geführt und gilt bis zum Monatsende.
+function huEndOfMonth(iso) {
+  const [y, m] = String(iso).split("-").map(Number);
+  const last = new Date(Date.UTC(y, m, 0)).getUTCDate();
+  return `${y}-${String(m).padStart(2, "0")}-${String(last).padStart(2, "0")}`;
+}
+
+function formatMonthYear(iso) {
+  const [y, m] = String(iso).split("-");
+  return `${m}/${y}`;
+}
+
 function formatKm(value) {
   return new Intl.NumberFormat("de-DE").format(Number(value)) + " km";
 }
@@ -982,10 +994,10 @@ function computeDueItems(vehicle, services, settings = getDueSettings()) {
   const items = [];
 
   if (vehicle.hu_due_date) {
-    const d = dateDueStatus(vehicle.hu_due_date, settings.due_soon_days_hu);
+    const d = dateDueStatus(huEndOfMonth(vehicle.hu_due_date), settings.due_soon_days_hu);
     items.push({
       vehicle, kind: "hu", title: "HU / TÜV", status: d.status,
-      detail: `${formatDateDisplay(vehicle.hu_due_date)} · ${d.text}`,
+      detail: `bis ${formatMonthYear(vehicle.hu_due_date)} · ${d.text}`,
       sortKey: d.days
     });
   }
@@ -1242,7 +1254,7 @@ async function renderVehicleDetailView(vehicleId) {
         <div class="service-header"><h2 class="card-title">Fahrzeugdaten</h2></div>
         <div class="info-grid">
           ${infoItem("Marke", vehicle.brand)}${infoItem("Modell", vehicle.model)}${infoItem("Motor", vehicle.engine)}${infoItem("Baujahr", vehicle.year)}
-          ${infoItem("Farbe", vehicle.color)}${infoItem("Kennzeichen", vehicle.license_plate)}${infoItem("FIN", vehicle.fin)}${infoItem("Kilometerstand", vehicle.mileage ? vehicle.mileage + " km" : "–")}${infoItem("HU / TÜV fällig", vehicle.hu_due_date ? formatDateDisplay(vehicle.hu_due_date) : "–")}
+          ${infoItem("Farbe", vehicle.color)}${infoItem("Kennzeichen", vehicle.license_plate)}${infoItem("FIN", vehicle.fin)}${infoItem("Kilometerstand", vehicle.mileage ? vehicle.mileage + " km" : "–")}${infoItem("HU / TÜV fällig", vehicle.hu_due_date ? formatMonthYear(vehicle.hu_due_date) : "–")}
         </div>
       </section>
 
@@ -1352,11 +1364,7 @@ function vehicleFormFields(v) {
     </div>
     <div class="form-section">
       <h3 class="section-title">HU / TÜV</h3>
-      <div class="field">
-        <label for="f-hu-due">Nächste HU / TÜV fällig am</label>
-        <input id="f-hu-due" type="date" name="hu_due_date" value="${v?.hu_due_date || ""}">
-        <p class="field-hint">Steht auf der Plakette (Monat/Jahr) bzw. im Prüfbericht. Ab ${getDueSettings().due_soon_days_hu} Tagen vorher erscheint ein Hinweis auf der Startseite (in den Einstellungen änderbar).</p>
-      </div>
+      ${huFieldsHtml(v?.hu_due_date)}
     </div>
     <div class="form-section"><h3 class="section-title">Kosten</h3>
       <div class="field-row"><div class="field"><label for="f-purchase-price">Kaufpreis (€)</label><input id="f-purchase-price" type="number" step="0.01" min="0" name="purchase_price" value="${v?.purchase_price ?? ""}"></div><div class="field"><label for="f-purchase-date">Kaufdatum</label><input id="f-purchase-date" type="date" name="purchase_date" value="${v?.purchase_date || ""}"></div></div>
@@ -1364,6 +1372,20 @@ function vehicleFormFields(v) {
       <div class="field"><label for="f-insurance-month">Fälligkeitsmonat Versicherung (jährlich)</label><select id="f-insurance-month" name="insurance_due_month"><option value="">Monat auswählen</option>${monthNames.map((m, i) => `<option value="${i + 1}" ${Number(v?.insurance_due_month) === i + 1 ? "selected" : ""}>${m}</option>`).join("")}</select></div>
       <div class="field-row"><div class="field"><label for="f-tax">Kfz-Steuer pro Jahr (€)</label><input id="f-tax" type="number" step="0.01" min="0" name="tax_amount" value="${v?.tax_amount ?? ""}"></div><div class="field"><label for="f-tax-month">Fälligkeitsmonat Steuer</label><select id="f-tax-month" name="tax_due_month"><option value="">Monat auswählen</option>${monthNames.map((m, i) => `<option value="${i + 1}" ${Number(v?.tax_due_month) === i + 1 ? "selected" : ""}>${m}</option>`).join("")}</select></div></div>
     </div>`;
+}
+
+function huFieldsHtml(huDueDate) {
+  const [selYear, selMonth] = huDueDate ? String(huDueDate).split("-").map(Number) : [null, null];
+  const thisYear = new Date().getFullYear();
+  const firstYear = Math.min(thisYear - 2, selYear || thisYear);
+  const lastYear = Math.max(thisYear + 5, selYear || thisYear);
+  const years = [];
+  for (let y = firstYear; y <= lastYear; y++) years.push(y);
+  return `<div class="field-row">
+        <div class="field"><label for="f-hu-month">Nächste HU – Monat</label><select id="f-hu-month" name="hu_month"><option value="">–</option>${monthNames.map((m, i) => `<option value="${i + 1}" ${selMonth === i + 1 ? "selected" : ""}>${String(i + 1).padStart(2, "0")} – ${m}</option>`).join("")}</select></div>
+        <div class="field"><label for="f-hu-year">Jahr</label><select id="f-hu-year" name="hu_year"><option value="">–</option>${years.map(y => `<option value="${y}" ${selYear === y ? "selected" : ""}>${y}</option>`).join("")}</select></div>
+      </div>
+      <p class="field-hint">Wie auf der Plakette: Monat und Jahr. Die HU gilt bis zum Monatsende. Ab ${getDueSettings().due_soon_days_hu} Tagen vorher erscheint ein Hinweis auf der Startseite (in den Einstellungen änderbar).</p>`;
 }
 
 function renderVehicleFormView(vehicle) {
@@ -1458,7 +1480,7 @@ async function renderServiceFormView(vehicleId, serviceId) {
             <div class="field"><label for="s-next-mileage">Bei Kilometerstand</label><input id="s-next-mileage" type="number" name="next_service_mileage" value="${service?.next_service_mileage ?? ""}" placeholder="z.B. 395000"></div>
             <div class="field"><label for="s-next-date">Am Datum</label><input id="s-next-date" type="date" name="next_service_date" value="${service?.next_service_date || ""}"></div>
           </div>
-          <p class="field-hint">Bei Wartungsart „TÜV“ wird das Datum automatisch als nächster HU/TÜV-Termin am Fahrzeug übernommen.</p>
+          <p class="field-hint">Bei Wartungsart „TÜV“ werden Monat und Jahr dieses Datums automatisch als nächste HU am Fahrzeug übernommen.</p>
         </div>
 
         <div class="form-section">
@@ -1782,6 +1804,10 @@ function bindVehicleForm() {
   form.addEventListener("submit", async (e) => {
     e.preventDefault();
     const raw = readFormData(form);
+    if (!!raw.hu_month !== !!raw.hu_year) {
+      alert("Bitte für die nächste HU sowohl Monat als auch Jahr auswählen – oder beides leer lassen.");
+      return;
+    }
     const fields = {
       name: raw.name, brand: raw.brand || null, model: raw.model || null,
       engine: raw.engine || null, year: numOrNull(raw.year), color: raw.color || null,
@@ -1789,7 +1815,9 @@ function bindVehicleForm() {
       purchase_price: numOrNull(raw.purchase_price), purchase_date: raw.purchase_date || null,
       insurance_amount: numOrNull(raw.insurance_amount), insurance_frequency: raw.insurance_frequency,
       insurance_due_month: numOrNull(raw.insurance_due_month), tax_amount: numOrNull(raw.tax_amount), tax_due_month: numOrNull(raw.tax_due_month),
-      hu_due_date: raw.hu_due_date || null
+      hu_due_date: raw.hu_month && raw.hu_year
+        ? huEndOfMonth(`${raw.hu_year}-${String(raw.hu_month).padStart(2, "0")}`)
+        : null
     };
 
     if (form.dataset.mode === "edit") {
@@ -1844,8 +1872,9 @@ function bindServiceForm() {
       }
       if (fields.service_type === "TÜV" && fields.next_service_date) {
         const vehicle = await idbGetById("vehicles", vehicleId);
-        if (vehicle && vehicle.hu_due_date !== fields.next_service_date) {
-          await updateVehicle(vehicle.id, { hu_due_date: fields.next_service_date });
+        const huDue = huEndOfMonth(fields.next_service_date);
+        if (vehicle && vehicle.hu_due_date !== huDue) {
+          await updateVehicle(vehicle.id, { hu_due_date: huDue });
         }
       }
       await queueFormFiles(pendingFiles, vehicleId, { serviceId });

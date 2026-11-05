@@ -7,6 +7,7 @@ import io
 import zipfile
 import re
 import hashlib
+import calendar
 
 from flask import (
     Flask,
@@ -459,6 +460,23 @@ VEHICLE_FIELDS = [
 VEHICLE_DATE_FIELDS = {"purchase_date", "hu_due_date"}
 
 
+def end_of_month(value):
+    return value.replace(day=calendar.monthrange(value.year, value.month)[1])
+
+
+def parse_vehicle_date(field, value):
+    """Wandelt einen Datumswert um. Die HU wird nur mit Monat/Jahr geführt
+    und immer als letzter Tag des Monats gespeichert (gültig bis Monatsende).
+    Akzeptiert für die HU auch „YYYY-MM“."""
+    if not value:
+        return None
+    if field == "hu_due_date":
+        if len(value) == 7:
+            value = value + "-01"
+        return end_of_month(date.fromisoformat(value))
+    return date.fromisoformat(value)
+
+
 @app.route("/api/vehicles", methods=["POST"])
 @require_token
 def api_create_vehicle():
@@ -470,7 +488,7 @@ def api_create_vehicle():
 
     values = {field: data.get(field) for field in VEHICLE_FIELDS}
     for field in VEHICLE_DATE_FIELDS:
-        values[field] = date.fromisoformat(values[field]) if values.get(field) else None
+        values[field] = parse_vehicle_date(field, values.get(field))
     vehicle = Vehicle(**values)
 
     db.session.add(vehicle)
@@ -490,7 +508,7 @@ def api_update_vehicle(vehicle_id):
         if field in data:
             value = data[field]
             if field in VEHICLE_DATE_FIELDS:
-                value = date.fromisoformat(value) if value else None
+                value = parse_vehicle_date(field, value)
             setattr(vehicle, field, value)
 
     db.session.commit()
@@ -814,7 +832,7 @@ def api_export_vehicle_pdf(vehicle_id):
         ("Marke", vehicle.brand), ("Modell", vehicle.model), ("Motor", vehicle.engine), ("Baujahr", vehicle.year),
         ("Farbe", vehicle.color), ("Kennzeichen", vehicle.license_plate), ("FIN / VIN", vehicle.fin),
         ("Kilometerstand", f"{vehicle.mileage} km" if vehicle.mileage is not None else None),
-        ("HU / TÜV fällig", vehicle.hu_due_date.strftime("%d.%m.%Y") if vehicle.hu_due_date else None), ("", "")
+        ("HU / TÜV fällig", vehicle.hu_due_date.strftime("%m/%Y") if vehicle.hu_due_date else None), ("", "")
     ]
     vehicle_rows = []
     for idx in range(0, len(vehicle_info), 2):
@@ -1140,7 +1158,7 @@ def api_import():
             insurance_due_month=old_vehicle.get("insuranceDueMonth"),
             tax_amount=old_vehicle.get("taxAmount"),
             tax_due_month=old_vehicle.get("taxDueMonth"),
-            hu_due_date=date.fromisoformat(old_vehicle["huDueDate"]) if old_vehicle.get("huDueDate") else None
+            hu_due_date=parse_vehicle_date("hu_due_date", old_vehicle.get("huDueDate"))
         )
         db.session.add(vehicle)
         db.session.flush()
