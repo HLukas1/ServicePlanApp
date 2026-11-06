@@ -6,6 +6,8 @@ import json
 import io
 import zipfile
 import re
+import hashlib
+import calendar
 
 from flask import (
     Flask,
@@ -22,6 +24,23 @@ from flask_sqlalchemy import SQLAlchemy
 
 
 app = Flask(__name__)
+
+
+# Versionskennung für app.js/style.css. Ändert sich der Inhalt (z.B. nach
+# einem Update), ändert sich die URL – Handy und Browser laden dann
+# automatisch die neue Datei statt einer alten Kopie aus dem Cache.
+def _compute_asset_version():
+    digest = hashlib.sha256()
+    for name in ("static/app.js", "static/style.css", "service-worker.js"):
+        try:
+            with open(os.path.join(app.root_path, name), "rb") as fh:
+                digest.update(fh.read())
+        except OSError:
+            pass
+    return digest.hexdigest()[:12]
+
+
+ASSET_VERSION = _compute_asset_version()
 
 # ============================================================
 # Sicherheits-Konfiguration
@@ -116,6 +135,7 @@ class Vehicle(db.Model):
     insurance_due_month = db.Column(db.Integer)
     tax_amount = db.Column(db.Numeric(10, 2))
     tax_due_month = db.Column(db.Integer)
+    hu_due_date = db.Column(db.Date)
 
     services = db.relationship(
         "Service",
@@ -150,7 +170,8 @@ class Vehicle(db.Model):
             "insurance_frequency": self.insurance_frequency or "yearly",
             "insurance_due_month": self.insurance_due_month,
             "tax_amount": float(self.tax_amount) if self.tax_amount is not None else None,
-            "tax_due_month": self.tax_due_month
+            "tax_due_month": self.tax_due_month,
+            "hu_due_date": self.hu_due_date.isoformat() if self.hu_due_date else None
         }
 
         if full:
@@ -233,6 +254,54 @@ class Note(db.Model):
             "title": self.title,
             "content": self.content
         }
+
+
+class Setting(db.Model):
+
+    key = db.Column(db.String(100), primary_key=True)
+    value = db.Column(db.Text)
+
+
+# Einstellbare Schwellen für „bald fällig“ (Standardwert, Minimum, Maximum).
+DUE_SETTING_LIMITS = {
+    "due_soon_days": (30, 0, 365),
+    "due_soon_days_hu": (60, 0, 365),
+    "due_soon_km": (1000, 0, 100000),
+}
+
+
+def get_app_settings():
+    stored = {s.key: s.value for s in Setting.query.all()}
+    result = {}
+    for key, (default, minimum, maximum) in DUE_SETTING_LIMITS.items():
+        try:
+            value = int(stored.get(key, default))
+        except (TypeError, ValueError):
+            value = default
+        result[key] = min(max(value, minimum), maximum)
+    return result
+
+
+def apply_app_settings(data):
+    """Übernimmt gültige Werte aus data. Gibt eine Fehlermeldung oder None zurück."""
+    if not isinstance(data, dict):
+        return "Ungültige Einstellungen."
+    values = {}
+    for key, (_default, minimum, maximum) in DUE_SETTING_LIMITS.items():
+        if key not in data:
+            continue
+        try:
+            value = int(data[key])
+        except (TypeError, ValueError):
+            return f"{key} muss eine ganze Zahl sein."
+        if not minimum <= value <= maximum:
+            return f"{key} muss zwischen {minimum} und {maximum} liegen."
+        values[key] = value
+    for key, value in values.items():
+        setting = db.session.get(Setting, key) or Setting(key=key)
+        setting.value = str(value)
+        db.session.add(setting)
+    return None
 
 
 class Attachment(db.Model):
@@ -322,7 +391,9 @@ def handle_unexpected_error(error):
 
 @app.route("/service-worker.js")
 def service_worker():
-    return send_from_directory(".", "service-worker.js", mimetype="application/javascript")
+    response = send_from_directory(app.root_path, "service-worker.js", mimetype="application/javascript")
+    response.headers["Cache-Control"] = "no-cache"
+    return response
 
 # ============================================================
 # PWA-Shell (statische Seite, keine Nutzdaten enthalten)
@@ -330,7 +401,11 @@ def service_worker():
 
 @app.route("/")
 def index():
-    return render_template("index.html")
+    response = app.make_response(render_template("index.html", asset_version=ASSET_VERSION))
+    # Die Startseite immer beim Server nachfragen, damit neue Versionen
+    # sofort ankommen. Offline liefert der Service Worker die gespeicherte Kopie.
+    response.headers["Cache-Control"] = "no-cache"
+    return response
 
 
 # ============================================================
@@ -345,8 +420,30 @@ def api_sync():
 
     return jsonify({
         "server_time": datetime.now(timezone.utc).isoformat(),
-        "vehicles": [v.to_dict(full=True) for v in vehicles]
+        "vehicles": [v.to_dict(full=True) for v in vehicles],
+        "settings": get_app_settings()
     })
+
+
+# ============================================================
+# API: Einstellungen
+# ============================================================
+
+@app.route("/api/settings", methods=["GET"])
+@require_token
+def api_get_settings():
+    return jsonify(get_app_settings())
+
+
+@app.route("/api/settings", methods=["PUT"])
+@require_token
+def api_update_settings():
+    data = request.get_json(force=True, silent=True)
+    error = apply_app_settings(data)
+    if error:
+        return jsonify({"error": error}), 400
+    db.session.commit()
+    return jsonify(get_app_settings())
 
 
 # ============================================================
@@ -357,8 +454,27 @@ VEHICLE_FIELDS = [
     "name", "brand", "model", "engine", "year",
     "color", "license_plate", "mileage", "fin", "photo_attachment_id",
     "purchase_price", "purchase_date", "insurance_amount", "insurance_frequency",
-    "insurance_due_month", "tax_amount", "tax_due_month"
+    "insurance_due_month", "tax_amount", "tax_due_month", "hu_due_date"
 ]
+
+VEHICLE_DATE_FIELDS = {"purchase_date", "hu_due_date"}
+
+
+def end_of_month(value):
+    return value.replace(day=calendar.monthrange(value.year, value.month)[1])
+
+
+def parse_vehicle_date(field, value):
+    """Wandelt einen Datumswert um. Die HU wird nur mit Monat/Jahr geführt
+    und immer als letzter Tag des Monats gespeichert (gültig bis Monatsende).
+    Akzeptiert für die HU auch „YYYY-MM“."""
+    if not value:
+        return None
+    if field == "hu_due_date":
+        if len(value) == 7:
+            value = value + "-01"
+        return end_of_month(date.fromisoformat(value))
+    return date.fromisoformat(value)
 
 
 @app.route("/api/vehicles", methods=["POST"])
@@ -371,8 +487,8 @@ def api_create_vehicle():
         return jsonify({"error": "Name ist erforderlich."}), 400
 
     values = {field: data.get(field) for field in VEHICLE_FIELDS}
-    if values.get("purchase_date"):
-        values["purchase_date"] = date.fromisoformat(values["purchase_date"])
+    for field in VEHICLE_DATE_FIELDS:
+        values[field] = parse_vehicle_date(field, values.get(field))
     vehicle = Vehicle(**values)
 
     db.session.add(vehicle)
@@ -391,8 +507,8 @@ def api_update_vehicle(vehicle_id):
     for field in VEHICLE_FIELDS:
         if field in data:
             value = data[field]
-            if field == "purchase_date" and value:
-                value = date.fromisoformat(value)
+            if field in VEHICLE_DATE_FIELDS:
+                value = parse_vehicle_date(field, value)
             setattr(vehicle, field, value)
 
     db.session.commit()
@@ -715,14 +831,15 @@ def api_export_vehicle_pdf(vehicle_id):
     vehicle_info = [
         ("Marke", vehicle.brand), ("Modell", vehicle.model), ("Motor", vehicle.engine), ("Baujahr", vehicle.year),
         ("Farbe", vehicle.color), ("Kennzeichen", vehicle.license_plate), ("FIN / VIN", vehicle.fin),
-        ("Kilometerstand", f"{vehicle.mileage} km" if vehicle.mileage is not None else None)
+        ("Kilometerstand", f"{vehicle.mileage} km" if vehicle.mileage is not None else None),
+        ("HU / TÜV fällig", vehicle.hu_due_date.strftime("%m/%Y") if vehicle.hu_due_date else None), ("", "")
     ]
     vehicle_rows = []
     for idx in range(0, len(vehicle_info), 2):
         left, right = vehicle_info[idx], vehicle_info[idx + 1]
         vehicle_rows.append([
             Paragraph(f"<b>{escape(left[0])}</b><br/>{escape(str(left[1] or '–'))}", styles["BodyText"]),
-            Paragraph(f"<b>{escape(right[0])}</b><br/>{escape(str(right[1] or '–'))}", styles["BodyText"])
+            Paragraph(f"<b>{escape(right[0])}</b><br/>{escape(str(right[1] or '–'))}" if right[0] else "", styles["BodyText"])
         ])
     vehicle_table = Table(vehicle_rows, colWidths=[87*mm, 87*mm], hAlign="LEFT")
     vehicle_table.setStyle(TableStyle([("BACKGROUND", (0,0), (-1,-1), colors.HexColor("#f3f4f6")), ("BOX", (0,0), (-1,-1), .4, colors.HexColor("#d1d5db")), ("INNERGRID", (0,0), (-1,-1), .3, colors.HexColor("#d1d5db")), ("VALIGN", (0,0), (-1,-1), "TOP"), ("LEFTPADDING", (0,0), (-1,-1), 8), ("RIGHTPADDING", (0,0), (-1,-1), 8), ("TOPPADDING", (0,0), (-1,-1), 7), ("BOTTOMPADDING", (0,0), (-1,-1), 7)]))
@@ -879,6 +996,7 @@ def api_export():
             "insuranceDueMonth": vehicle.insurance_due_month,
             "taxAmount": float(vehicle.tax_amount) if vehicle.tax_amount is not None else None,
             "taxDueMonth": vehicle.tax_due_month,
+            "huDueDate": vehicle.hu_due_date.isoformat() if vehicle.hu_due_date else None,
         })
 
     maintenances_data = []
@@ -947,6 +1065,7 @@ def api_export():
         "maintenances": maintenances_data,
         "notes": notes_data,
         "attachments": attachments_data,
+        "settings": get_app_settings(),
     }
 
     buffer = io.BytesIO()
@@ -1038,7 +1157,8 @@ def api_import():
             insurance_frequency=old_vehicle.get("insuranceFrequency") or "yearly",
             insurance_due_month=old_vehicle.get("insuranceDueMonth"),
             tax_amount=old_vehicle.get("taxAmount"),
-            tax_due_month=old_vehicle.get("taxDueMonth")
+            tax_due_month=old_vehicle.get("taxDueMonth"),
+            hu_due_date=parse_vehicle_date("hu_due_date", old_vehicle.get("huDueDate"))
         )
         db.session.add(vehicle)
         db.session.flush()
@@ -1157,6 +1277,9 @@ def api_import():
             if vehicle:
                 vehicle.photo_attachment_id = new_photo_id
 
+    if isinstance(data.get("settings"), dict):
+        apply_app_settings(data["settings"])
+
     db.session.commit()
 
     if zip_file:
@@ -1189,7 +1312,8 @@ with app.app_context():
         "photo_attachment_id": "INTEGER",
         "purchase_price": "NUMERIC(10, 2)", "purchase_date": "DATE",
         "insurance_amount": "NUMERIC(10, 2)", "insurance_frequency": "VARCHAR(10) NOT NULL DEFAULT 'yearly'",
-        "insurance_due_month": "INTEGER", "tax_amount": "NUMERIC(10, 2)", "tax_due_month": "INTEGER"
+        "insurance_due_month": "INTEGER", "tax_amount": "NUMERIC(10, 2)", "tax_due_month": "INTEGER",
+        "hu_due_date": "DATE"
     }
     for column, sql_type in migrations.items():
         if column not in vehicle_columns:

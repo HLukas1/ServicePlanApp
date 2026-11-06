@@ -56,9 +56,15 @@ function idbPut(store, value) {
 }
 
 function idbDelete(store, key) {
+  // Server-IDs liegen als Zahl im Speicher, aus HTML-Attributen kommen sie als
+  // Text („3“). Deshalb immer beide Varianten löschen.
+  const keys = [key];
+  if (typeof key === "string" && /^\d+$/.test(key)) keys.push(Number(key));
+  else if (typeof key === "number") keys.push(String(key));
   return openDatabase().then(db => new Promise((resolve, reject) => {
     const tx = db.transaction(store, "readwrite");
-    tx.objectStore(store).delete(key);
+    const os = tx.objectStore(store);
+    for (const k of keys) os.delete(k);
     tx.oncomplete = () => resolve();
     tx.onerror = () => reject(tx.error);
   }));
@@ -148,7 +154,9 @@ async function apiFetch(path, { method = "GET", body } = {}) {
       const data = await res.json();
       if (data && data.error) message = data.error;
     } catch (e) { /* ignore */ }
-    throw new Error(message);
+    const err = new Error(message);
+    err.code = res.status;
+    throw err;
   }
 
   if (res.status === 204) return null;
@@ -237,7 +245,11 @@ async function deleteVehicle(id) {
   for (const s of services) await idbDelete("services", s.id);
   const notes = (await idbGetAll("notes")).filter(n => idEq(n.vehicle_id, id));
   for (const n of notes) await idbDelete("notes", n.id);
-  await enqueue("vehicle", "delete", id, null);
+  const attachments = (await idbGetAll("attachments")).filter(a => idEq(a.vehicle_id, id));
+  for (const a of attachments) await idbDelete("attachments", a.id);
+  const alreadyQueued = (await idbGetAll("queue"))
+    .some(q => q.kind === "vehicle" && q.op === "delete" && idEq(q.entityId, id));
+  if (!alreadyQueued) await enqueue("vehicle", "delete", id, null);
   triggerSync();
 }
 
@@ -551,69 +563,84 @@ async function flushQueue() {
 
     if (item.op === "update" && String(entityId).startsWith("tmp-")) break;
 
-    if (item.kind === "attachment" && item.op === "create") {
-      const localAttachment = await idbGetById("attachments", item.entityId);
-      if (!localAttachment?.blob) break;
-
-      // Bei einem offline neu angelegten Fahrzeug/Wartung/Notiz können
-      // die IDs noch temporär sein. Immer die tatsächlichen Referenzen
-      // aus dem lokalen Attachment verwenden und bereits aufgelöste
-      // Server-IDs aus idMap einsetzen.
-      payload = { ...(payload || {}) };
-      const attachmentVehicleId = payload.vehicle_id ?? localAttachment.vehicle_id;
-      const attachmentServiceId = payload.service_id ?? localAttachment.service_id;
-      const attachmentNoteId = payload.note_id ?? localAttachment.note_id;
-      if (attachmentVehicleId != null) payload.vehicle_id = idMap[attachmentVehicleId] || attachmentVehicleId;
-      if (attachmentServiceId != null) payload.service_id = idMap[attachmentServiceId] || attachmentServiceId;
-      if (attachmentNoteId != null) payload.note_id = idMap[attachmentNoteId] || attachmentNoteId;
-
-      // Sicherheit: niemals einen Upload ohne Fahrzeug-ID an die API schicken.
-      if (payload.vehicle_id == null || String(payload.vehicle_id).startsWith("tmp-")) break;
-
-      const created = await apiUploadAttachment(localAttachment, payload);
-      idMap[item.entityId] = created.id;
-      await idbDelete("attachments", item.entityId);
-
-      const localVehicle = await idbGetById("vehicles", payload.vehicle_id);
-      if (localVehicle && idEq(localVehicle.photo_attachment_id, item.entityId)) {
-        localVehicle.photo_attachment_id = created.id;
-        await idbPut("vehicles", localVehicle);
+    try {
+      if (item.kind === "settings") {
+        const saved = await apiFetch("/api/settings", { method: "PUT", body: payload });
+        storeDueSettings(saved);
+        await idbDelete("queue", item.localId);
+        continue;
       }
 
-      await idbPut("attachments", created);
-    } else if (item.op === "create") {
-      const created = await apiFetch(kindEndpoint(item.kind), { method: "POST", body: payload });
+      if (item.kind === "attachment" && item.op === "create") {
+        const localAttachment = await idbGetById("attachments", item.entityId);
+        if (!localAttachment?.blob) break;
 
-      if (!idEq(entityId, created.id)) {
-        idMap[entityId] = created.id;
-        await idbDelete(storeFor(item.kind), entityId);
+        // Bei einem offline neu angelegten Fahrzeug/Wartung/Notiz können
+        // die IDs noch temporär sein. Immer die tatsächlichen Referenzen
+        // aus dem lokalen Attachment verwenden und bereits aufgelöste
+        // Server-IDs aus idMap einsetzen.
+        payload = { ...(payload || {}) };
+        const attachmentVehicleId = payload.vehicle_id ?? localAttachment.vehicle_id;
+        const attachmentServiceId = payload.service_id ?? localAttachment.service_id;
+        const attachmentNoteId = payload.note_id ?? localAttachment.note_id;
+        if (attachmentVehicleId != null) payload.vehicle_id = idMap[attachmentVehicleId] || attachmentVehicleId;
+        if (attachmentServiceId != null) payload.service_id = idMap[attachmentServiceId] || attachmentServiceId;
+        if (attachmentNoteId != null) payload.note_id = idMap[attachmentNoteId] || attachmentNoteId;
 
-        if (item.kind === "vehicle") {
-          // Nach dem ersten Server-Sync bekommt ein neues Fahrzeug eine
-          // numerische ID. Die Detailseite muss auf diese ID umgestellt werden.
-          const route = parseRoute();
-          if (route.name === "vehicle" && idEq(route.vehicleId, entityId)) {
-            location.hash = `#/vehicle/${created.id}`;
-          }
-          for (const s of await idbGetAll("services")) {
-            if (idEq(s.vehicle_id, entityId)) { s.vehicle_id = created.id; await idbPut("services", s); }
-          }
-          for (const n of await idbGetAll("notes")) {
-            if (idEq(n.vehicle_id, entityId)) { n.vehicle_id = created.id; await idbPut("notes", n); }
-          }
-          for (const a of await idbGetAll("attachments")) {
-            if (idEq(a.vehicle_id, entityId)) { a.vehicle_id = created.id; await idbPut("attachments", a); }
+        // Sicherheit: niemals einen Upload ohne Fahrzeug-ID an die API schicken.
+        if (payload.vehicle_id == null || String(payload.vehicle_id).startsWith("tmp-")) break;
+
+        const created = await apiUploadAttachment(localAttachment, payload);
+        idMap[item.entityId] = created.id;
+        await idbDelete("attachments", item.entityId);
+
+        const localVehicle = await idbGetById("vehicles", payload.vehicle_id);
+        if (localVehicle && idEq(localVehicle.photo_attachment_id, item.entityId)) {
+          localVehicle.photo_attachment_id = created.id;
+          await idbPut("vehicles", localVehicle);
+        }
+
+        await idbPut("attachments", created);
+      } else if (item.op === "create") {
+        const created = await apiFetch(kindEndpoint(item.kind), { method: "POST", body: payload });
+
+        if (!idEq(entityId, created.id)) {
+          idMap[entityId] = created.id;
+          await idbDelete(storeFor(item.kind), entityId);
+
+          if (item.kind === "vehicle") {
+            // Nach dem ersten Server-Sync bekommt ein neues Fahrzeug eine
+            // numerische ID. Die Detailseite muss auf diese ID umgestellt werden.
+            const route = parseRoute();
+            if (route.name === "vehicle" && idEq(route.vehicleId, entityId)) {
+              location.hash = `#/vehicle/${created.id}`;
+            }
+            for (const s of await idbGetAll("services")) {
+              if (idEq(s.vehicle_id, entityId)) { s.vehicle_id = created.id; await idbPut("services", s); }
+            }
+            for (const n of await idbGetAll("notes")) {
+              if (idEq(n.vehicle_id, entityId)) { n.vehicle_id = created.id; await idbPut("notes", n); }
+            }
+            for (const a of await idbGetAll("attachments")) {
+              if (idEq(a.vehicle_id, entityId)) { a.vehicle_id = created.id; await idbPut("attachments", a); }
+            }
           }
         }
-      }
 
-      await idbPut(storeFor(item.kind), created);
-    } else if (item.op === "update") {
-      const updated = await apiFetch(`${kindEndpoint(item.kind)}/${entityId}`, { method: "PUT", body: payload });
-      await idbPut(storeFor(item.kind), updated);
-    } else if (item.op === "delete") {
-      await apiFetch(`${kindEndpoint(item.kind)}/${entityId}`, { method: "DELETE" });
-      await idbDelete(storeFor(item.kind), entityId);
+        await idbPut(storeFor(item.kind), created);
+      } else if (item.op === "update") {
+        const updated = await apiFetch(`${kindEndpoint(item.kind)}/${entityId}`, { method: "PUT", body: payload });
+        await idbPut(storeFor(item.kind), updated);
+      } else if (item.op === "delete") {
+        await apiFetch(`${kindEndpoint(item.kind)}/${entityId}`, { method: "DELETE" });
+        await idbDelete(storeFor(item.kind), entityId);
+      }
+    } catch (err) {
+      // 404: Der Datensatz existiert auf dem Server nicht (mehr), z.B. weil er
+      // schon gelöscht wurde. Den Eintrag verwerfen, sonst blockiert er jeden
+      // weiteren Sync mit „Nicht gefunden“.
+      if (err.code !== 404) throw err;
+      console.warn("Veralteter Eintrag in der Warteschlange verworfen:", item, err.message);
     }
 
     await idbDelete("queue", item.localId);
@@ -627,9 +654,14 @@ async function pullSnapshot() {
   // Snapshot ersetzen, aber lokale Datensätze mit offenen Änderungen erhalten.
   // Sonst verschwindet ein gerade offline angelegtes Fahrzeug beim Sync und
   // die Detailansicht zeigt fälschlich „Fahrzeug nicht gefunden“.
+  if (data.settings && !queue.some(item => item.kind === "settings")) {
+    storeDueSettings(data.settings);
+  }
+
   const pendingRecords = [];
   const pendingDeletes = [];
   for (const item of queue) {
+    if (item.kind === "settings") continue;
     if (item.op === "delete") {
       pendingDeletes.push({ store: storeFor(item.kind), id: item.entityId });
     } else {
@@ -898,10 +930,190 @@ function renderErrorView(err) {
   </main>`;
 }
 
+// ---------- Fälligkeiten ----------
+
+// Standardwerte für „bald fällig“. Eigene Werte werden in den Einstellungen
+// gesetzt, auf dem Server gespeichert und lokal für den Offline-Betrieb vorgehalten.
+const DUE_SETTING_DEFAULTS = { due_soon_days: 30, due_soon_days_hu: 60, due_soon_km: 1000 };
+const DUE_SETTING_LIMITS = { due_soon_days: [0, 365], due_soon_days_hu: [0, 365], due_soon_km: [0, 100000] };
+
+function getDueSettings() {
+  let stored = {};
+  try { stored = JSON.parse(localStorage.getItem("dueSettings") || "{}") || {}; } catch (_) { stored = {}; }
+  const result = {};
+  for (const [key, def] of Object.entries(DUE_SETTING_DEFAULTS)) {
+    const value = Number(stored[key]);
+    const [min, max] = DUE_SETTING_LIMITS[key];
+    result[key] = Number.isInteger(value) && value >= min && value <= max ? value : def;
+  }
+  return result;
+}
+
+function storeDueSettings(settings) {
+  try { localStorage.setItem("dueSettings", JSON.stringify(settings)); } catch (_) {}
+}
+
+async function saveDueSettings(settings) {
+  storeDueSettings(settings);
+  // Ältere, noch nicht gesendete Einstellungsänderungen ersetzen.
+  for (const item of await idbGetAll("queue")) {
+    if (item.kind === "settings") await idbDelete("queue", item.localId);
+  }
+  await enqueue("settings", "update", "settings", settings);
+  // Ohne Neuaufbau der Seite synchronisieren, damit die Bestätigung sichtbar bleibt.
+  return sync({ rerender: false });
+}
+
+const DUE_RANK = { overdue: 0, soon: 1, ok: 2 };
+
+function todayIso() {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
+
+function daysUntil(iso) {
+  const [y, m, d] = iso.split("-").map(Number);
+  const [ty, tm, td] = todayIso().split("-").map(Number);
+  return Math.round((Date.UTC(y, m - 1, d) - Date.UTC(ty, tm - 1, td)) / 86400000);
+}
+
+function dateDueStatus(iso, soonDays) {
+  const days = daysUntil(iso);
+  const status = days < 0 ? "overdue" : days <= soonDays ? "soon" : "ok";
+  let text;
+  if (days < 0) text = `seit ${-days} Tag${days === -1 ? "" : "en"} überfällig`;
+  else if (days === 0) text = "heute fällig";
+  else text = `in ${days} Tag${days === 1 ? "" : "en"}`;
+  return { status, days, text };
+}
+
+// HU/TÜV wird nur mit Monat/Jahr geführt und gilt bis zum Monatsende.
+function huEndOfMonth(iso) {
+  const [y, m] = String(iso).split("-").map(Number);
+  const last = new Date(Date.UTC(y, m, 0)).getUTCDate();
+  return `${y}-${String(m).padStart(2, "0")}-${String(last).padStart(2, "0")}`;
+}
+
+function formatMonthYear(iso) {
+  const [y, m] = String(iso).split("-");
+  return `${m}/${y}`;
+}
+
+function formatKm(value) {
+  return new Intl.NumberFormat("de-DE").format(Number(value)) + " km";
+}
+
+function worstStatus(statuses) {
+  return statuses.reduce((worst, s) => (DUE_RANK[s] < DUE_RANK[worst] ? s : worst), "ok");
+}
+
+// Ermittelt alle anstehenden Termine eines Fahrzeugs.
+// Pro Wartungsart zählt nur die jüngste Wartung mit Angabe zur nächsten Wartung,
+// ältere Vorgaben sind damit erledigt.
+function computeDueItems(vehicle, services, settings = getDueSettings()) {
+  const items = [];
+
+  if (vehicle.hu_due_date) {
+    const d = dateDueStatus(huEndOfMonth(vehicle.hu_due_date), settings.due_soon_days_hu);
+    items.push({
+      vehicle, kind: "hu", title: "HU / TÜV", status: d.status,
+      detail: `bis ${formatMonthYear(vehicle.hu_due_date)} · ${d.text}`,
+      sortKey: d.days
+    });
+  }
+
+  const latestByType = new Map();
+  services
+    .filter(s => s.next_service_mileage || s.next_service_date)
+    .sort((a, b) => (b.date || "").localeCompare(a.date || ""))
+    .forEach(s => {
+      const type = s.service_type || "Wartung";
+      if (!latestByType.has(type)) latestByType.set(type, s);
+    });
+
+  for (const [type, s] of latestByType) {
+    const parts = [];
+    const statuses = [];
+    let sortKey = Infinity;
+
+    if (s.next_service_date) {
+      const d = dateDueStatus(s.next_service_date, settings.due_soon_days);
+      statuses.push(d.status);
+      parts.push(`${formatDateDisplay(s.next_service_date)} · ${d.text}`);
+      sortKey = Math.min(sortKey, d.days);
+    }
+
+    if (s.next_service_mileage) {
+      const target = Number(s.next_service_mileage);
+      if (vehicle.mileage != null && vehicle.mileage !== "") {
+        const remaining = target - Number(vehicle.mileage);
+        const status = remaining <= 0 ? "overdue" : remaining <= settings.due_soon_km ? "soon" : "ok";
+        statuses.push(status);
+        parts.push(remaining <= 0
+          ? `bei ${formatKm(target)} · ${formatKm(-remaining)} drüber`
+          : `bei ${formatKm(target)} · noch ${formatKm(remaining)}`);
+        // grobe Umrechnung, damit km-Termine sinnvoll zwischen Datums-Terminen einsortiert werden
+        sortKey = Math.min(sortKey, remaining / 50);
+      } else {
+        statuses.push("ok");
+        parts.push(`bei ${formatKm(target)}`);
+      }
+    }
+
+    items.push({
+      vehicle, kind: "service", serviceId: s.id, title: type,
+      status: worstStatus(statuses), detail: parts.join(" · "), sortKey
+    });
+  }
+
+  return items.sort((a, b) => DUE_RANK[a.status] - DUE_RANK[b.status] || a.sortKey - b.sortKey);
+}
+
+const DUE_LABELS = { overdue: "Überfällig", soon: "Bald fällig", ok: "OK" };
+
+function dueRowHtml(item, { showVehicle = false } = {}) {
+  const icon = item.kind === "hu" ? "🛡️" : "🔧";
+  const href = item.kind === "hu" ? `#/vehicle/${item.vehicle.id}/edit` : `#/vehicle/${item.vehicle.id}`;
+  return `<a class="due-row due-${item.status}" href="${href}">
+    <span class="due-icon">${icon}</span>
+    <span class="due-main">
+      <span class="due-title">${showVehicle ? `${escapeHtml(item.vehicle.name)} – ` : ""}${escapeHtml(item.title)}</span>
+      <span class="due-detail">${escapeHtml(item.detail)}</span>
+    </span>
+    <span class="due-badge">${DUE_LABELS[item.status]}</span>
+  </a>`;
+}
+
 // ---------- Fahrzeugliste ----------
 
 async function renderVehicleListView() {
   const vehicles = (await idbGetAll("vehicles")).sort((a, b) => (a.name || "").localeCompare(b.name || ""));
+  const allServices = await idbGetAll("services");
+
+  const dueSettings = getDueSettings();
+  const dueByVehicle = new Map(vehicles.map(v => [
+    String(v.id), computeDueItems(v, allServices.filter(s => idEq(s.vehicle_id, v.id)), dueSettings)
+  ]));
+  const pendingDue = [...dueByVehicle.values()].flat()
+    .filter(i => i.status !== "ok")
+    .sort((a, b) => DUE_RANK[a.status] - DUE_RANK[b.status] || a.sortKey - b.sortKey);
+
+  const vehicleBadge = (v) => {
+    const items = dueByVehicle.get(String(v.id)) || [];
+    if (!items.length) return "";
+    const status = worstStatus(items.map(i => i.status));
+    const count = items.filter(i => i.status === status).length;
+    const label = status === "ok" ? "Alles OK" : `${count}× ${DUE_LABELS[status].toLowerCase()}`;
+    return `<span class="due-pill due-${status}">${label}</span>`;
+  };
+
+  const dueSection = vehicles.length ? `
+      <section class="card due-overview">
+        <div class="service-header"><h2 class="card-title">Was ist fällig?</h2></div>
+        ${pendingDue.length
+          ? `<div class="due-list">${pendingDue.map(i => dueRowHtml(i, { showVehicle: true })).join("")}</div>`
+          : `<p class="empty-hint due-all-ok">✅ Aktuell ist nichts überfällig oder bald fällig.</p>`}
+      </section>` : "";
 
   const cards = vehicles.map(v => `
     <a class="vehicle-card" href="#/vehicle/${v.id}">
@@ -911,6 +1123,7 @@ async function renderVehicleListView() {
           <h3>${escapeHtml(v.name)}</h3>
           <p class="vehicle-sub">${escapeHtml(v.brand || "")} ${escapeHtml(v.model || "")}</p>
         </div>
+        ${vehicleBadge(v)}
       </div>
       ${(v.engine || v.year || v.mileage) ? `
       <div class="vehicle-meta">
@@ -935,6 +1148,8 @@ async function renderVehicleListView() {
         <a class="btn btn-primary" href="#/vehicle/add">${iconPlus} Fahrzeug hinzufügen</a>
       </section>
 
+      ${dueSection}
+
       ${vehicles.length ? `<div class="vehicle-grid">${cards}</div>` : `
         <div class="empty-state">
           <div class="empty-icon">🚗</div>
@@ -957,6 +1172,7 @@ async function renderVehicleDetailView(vehicleId) {
     .sort((a, b) => (b.date || "").localeCompare(a.date || ""));
 
   const notes = (await idbGetAll("notes")).filter(n => idEq(n.vehicle_id, vehicleId));
+  const dueItems = computeDueItems(vehicle, services);
   const attachments = (await idbGetAll("attachments"))
     .filter(a => idEq(a.vehicle_id, vehicleId))
     .sort((a, b) => (b.created_at || "").localeCompare(a.created_at || ""));
@@ -1058,8 +1274,15 @@ async function renderVehicleDetailView(vehicleId) {
         <div class="service-header"><h2 class="card-title">Fahrzeugdaten</h2></div>
         <div class="info-grid">
           ${infoItem("Marke", vehicle.brand)}${infoItem("Modell", vehicle.model)}${infoItem("Motor", vehicle.engine)}${infoItem("Baujahr", vehicle.year)}
-          ${infoItem("Farbe", vehicle.color)}${infoItem("Kennzeichen", vehicle.license_plate)}${infoItem("FIN", vehicle.fin)}${infoItem("Kilometerstand", vehicle.mileage ? vehicle.mileage + " km" : "–")}
+          ${infoItem("Farbe", vehicle.color)}${infoItem("Kennzeichen", vehicle.license_plate)}${infoItem("FIN", vehicle.fin)}${infoItem("Kilometerstand", vehicle.mileage ? vehicle.mileage + " km" : "–")}${infoItem("HU / TÜV fällig", vehicle.hu_due_date ? formatMonthYear(vehicle.hu_due_date) : "–")}
         </div>
+      </section>
+
+      <section class="card">
+        <div class="service-header"><h2 class="card-title">Termine</h2></div>
+        ${dueItems.length
+          ? `<div class="due-list">${dueItems.map(i => dueRowHtml(i)).join("")}</div>`
+          : `<p class="empty-hint">Keine Termine hinterlegt. Trage beim Fahrzeug den HU/TÜV-Termin oder bei einer Wartung die nächste Wartung ein.</p>`}
       </section>
 
       <section class="card vehicle-costs-link"><div><h2 class="card-title">Fahrzeugkosten</h2><p class="subtitle">Wartungen, Versicherung, Steuer und Kaufpreis</p></div><a class="btn btn-primary" href="#/vehicle/${vehicle.id}/costs">Kosten</a></section>
@@ -1159,12 +1382,30 @@ function vehicleFormFields(v) {
       <div class="field"><label for="f-fin">FIN / VIN</label><input id="f-fin" type="text" name="fin" value="${escapeHtml(v?.fin || "")}" placeholder="z.B. WAUZZZ281ZFA095461"></div>
       <div class="field"><label for="f-mileage">Kilometerstand</label><input id="f-mileage" type="number" name="mileage" value="${v?.mileage ?? ""}" placeholder="z.B. 380000"></div>
     </div>
+    <div class="form-section">
+      <h3 class="section-title">HU / TÜV</h3>
+      ${huFieldsHtml(v?.hu_due_date)}
+    </div>
     <div class="form-section"><h3 class="section-title">Kosten</h3>
       <div class="field-row"><div class="field"><label for="f-purchase-price">Kaufpreis (€)</label><input id="f-purchase-price" type="number" step="0.01" min="0" name="purchase_price" value="${v?.purchase_price ?? ""}"></div><div class="field"><label for="f-purchase-date">Kaufdatum</label><input id="f-purchase-date" type="date" name="purchase_date" value="${v?.purchase_date || ""}"></div></div>
       <div class="field-row"><div class="field"><label for="f-insurance">Versicherung (€)</label><input id="f-insurance" type="number" step="0.01" min="0" name="insurance_amount" value="${v?.insurance_amount ?? ""}"></div><div class="field"><label for="f-insurance-frequency">Zahlweise</label><select id="f-insurance-frequency" name="insurance_frequency"><option value="yearly" ${v?.insurance_frequency !== "monthly" ? "selected" : ""}>Jährlich</option><option value="monthly" ${v?.insurance_frequency === "monthly" ? "selected" : ""}>Monatlich</option></select></div></div>
       <div class="field"><label for="f-insurance-month">Fälligkeitsmonat Versicherung (jährlich)</label><select id="f-insurance-month" name="insurance_due_month"><option value="">Monat auswählen</option>${monthNames.map((m, i) => `<option value="${i + 1}" ${Number(v?.insurance_due_month) === i + 1 ? "selected" : ""}>${m}</option>`).join("")}</select></div>
       <div class="field-row"><div class="field"><label for="f-tax">Kfz-Steuer pro Jahr (€)</label><input id="f-tax" type="number" step="0.01" min="0" name="tax_amount" value="${v?.tax_amount ?? ""}"></div><div class="field"><label for="f-tax-month">Fälligkeitsmonat Steuer</label><select id="f-tax-month" name="tax_due_month"><option value="">Monat auswählen</option>${monthNames.map((m, i) => `<option value="${i + 1}" ${Number(v?.tax_due_month) === i + 1 ? "selected" : ""}>${m}</option>`).join("")}</select></div></div>
     </div>`;
+}
+
+function huFieldsHtml(huDueDate) {
+  const [selYear, selMonth] = huDueDate ? String(huDueDate).split("-").map(Number) : [null, null];
+  const thisYear = new Date().getFullYear();
+  const firstYear = Math.min(thisYear - 2, selYear || thisYear);
+  const lastYear = Math.max(thisYear + 5, selYear || thisYear);
+  const years = [];
+  for (let y = firstYear; y <= lastYear; y++) years.push(y);
+  return `<div class="field-row">
+        <div class="field"><label for="f-hu-month">Nächste HU – Monat</label><select id="f-hu-month" name="hu_month"><option value="">–</option>${monthNames.map((m, i) => `<option value="${i + 1}" ${selMonth === i + 1 ? "selected" : ""}>${String(i + 1).padStart(2, "0")} – ${m}</option>`).join("")}</select></div>
+        <div class="field"><label for="f-hu-year">Jahr</label><select id="f-hu-year" name="hu_year"><option value="">–</option>${years.map(y => `<option value="${y}" ${selYear === y ? "selected" : ""}>${y}</option>`).join("")}</select></div>
+      </div>
+      <p class="field-hint">Wie auf der Plakette: Monat und Jahr. Die HU gilt bis zum Monatsende. Ab ${getDueSettings().due_soon_days_hu} Tagen vorher erscheint ein Hinweis auf der Startseite (in den Einstellungen änderbar).</p>`;
 }
 
 function renderVehicleFormView(vehicle) {
@@ -1259,6 +1500,7 @@ async function renderServiceFormView(vehicleId, serviceId) {
             <div class="field"><label for="s-next-mileage">Bei Kilometerstand</label><input id="s-next-mileage" type="number" name="next_service_mileage" value="${service?.next_service_mileage ?? ""}" placeholder="z.B. 395000"></div>
             <div class="field"><label for="s-next-date">Am Datum</label><input id="s-next-date" type="date" name="next_service_date" value="${service?.next_service_date || ""}"></div>
           </div>
+          <p class="field-hint">Bei Wartungsart „TÜV“ werden Monat und Jahr dieses Datums automatisch als nächste HU am Fahrzeug übernommen.</p>
         </div>
 
         <div class="form-section">
@@ -1336,6 +1578,7 @@ async function renderSettingsView() {
   const pending = (await idbGetAll("queue")).length;
   const vehicles = (await idbGetAll("vehicles")).sort((a, b) => (a.name || "").localeCompare(b.name || ""));
   const lastSync = localStorage.getItem("lastSync");
+  const dueSettings = getDueSettings();
 
   return `${offlineBannerHtml()}
     ${topbarHtml({ backHref: "#/", title: "Einstellungen", icon: "⚙️", rightHref: null })}
@@ -1357,6 +1600,24 @@ async function renderSettingsView() {
             <button type="button" class="btn btn-primary" id="manual-sync-btn">Jetzt synchronisieren</button>
           <div id="manual-sync-result" class="sync-result" aria-live="polite"></div>
           </div>
+        </div>
+
+        <div class="card">
+          <h3 class="card-title">Fälligkeiten</h3>
+          <p class="card-text">Ab wann ein Termin auf der Startseite als „bald fällig“ angezeigt wird. Überfällig ist ein Termin immer ab dem Tag nach dem Fälligkeitsdatum bzw. sobald der Kilometerstand erreicht ist.</p>
+          <form id="due-settings-form">
+            <div class="field-row">
+              <div class="field"><label for="due-soon-days">Wartung nach Datum (Tage vorher)</label><input id="due-soon-days" type="number" inputmode="numeric" min="0" max="365" step="1" name="due_soon_days" value="${dueSettings.due_soon_days}" required></div>
+              <div class="field"><label for="due-soon-km">Wartung nach km (km vorher)</label><input id="due-soon-km" type="number" inputmode="numeric" min="0" max="100000" step="1" name="due_soon_km" value="${dueSettings.due_soon_km}" required></div>
+            </div>
+            <div class="field"><label for="due-soon-days-hu">HU / TÜV (Tage vorher)</label><input id="due-soon-days-hu" type="number" inputmode="numeric" min="0" max="365" step="1" name="due_soon_days_hu" value="${dueSettings.due_soon_days_hu}" required></div>
+            <p class="field-hint">Standard: ${DUE_SETTING_DEFAULTS.due_soon_days} Tage · ${new Intl.NumberFormat("de-DE").format(DUE_SETTING_DEFAULTS.due_soon_km)} km · HU/TÜV ${DUE_SETTING_DEFAULTS.due_soon_days_hu} Tage. Gilt für alle verbundenen Geräte.</p>
+            <div class="form-buttons">
+              <button type="submit" class="btn btn-primary">Speichern</button>
+              <button type="button" class="btn btn-secondary" id="due-settings-reset">Standardwerte</button>
+            </div>
+            <div id="due-settings-result" class="sync-result" aria-live="polite"></div>
+          </form>
         </div>
 
         <div class="card">
@@ -1563,13 +1824,20 @@ function bindVehicleForm() {
   form.addEventListener("submit", async (e) => {
     e.preventDefault();
     const raw = readFormData(form);
+    if (!!raw.hu_month !== !!raw.hu_year) {
+      alert("Bitte für die nächste HU sowohl Monat als auch Jahr auswählen – oder beides leer lassen.");
+      return;
+    }
     const fields = {
       name: raw.name, brand: raw.brand || null, model: raw.model || null,
       engine: raw.engine || null, year: numOrNull(raw.year), color: raw.color || null,
       license_plate: raw.license_plate || null, mileage: numOrNull(raw.mileage), fin: raw.fin || null,
       purchase_price: numOrNull(raw.purchase_price), purchase_date: raw.purchase_date || null,
       insurance_amount: numOrNull(raw.insurance_amount), insurance_frequency: raw.insurance_frequency,
-      insurance_due_month: numOrNull(raw.insurance_due_month), tax_amount: numOrNull(raw.tax_amount), tax_due_month: numOrNull(raw.tax_due_month)
+      insurance_due_month: numOrNull(raw.insurance_due_month), tax_amount: numOrNull(raw.tax_amount), tax_due_month: numOrNull(raw.tax_due_month),
+      hu_due_date: raw.hu_month && raw.hu_year
+        ? huEndOfMonth(`${raw.hu_year}-${String(raw.hu_month).padStart(2, "0")}`)
+        : null
     };
 
     if (form.dataset.mode === "edit") {
@@ -1621,6 +1889,13 @@ function bindServiceForm() {
         await updateService(serviceId, fields);
       } else {
         serviceId = await createService(vehicleId, fields);
+      }
+      if (fields.service_type === "TÜV" && fields.next_service_date) {
+        const vehicle = await idbGetById("vehicles", vehicleId);
+        const huDue = huEndOfMonth(fields.next_service_date);
+        if (vehicle && vehicle.hu_due_date !== huDue) {
+          await updateVehicle(vehicle.id, { hu_due_date: huDue });
+        }
       }
       await queueFormFiles(pendingFiles, vehicleId, { serviceId });
       location.hash = `#/vehicle/${vehicleId}`;
@@ -1684,6 +1959,34 @@ function bindSettings() {
   window.serverStatusTimer = setInterval(() => {
     updateServerStatus();
   }, 10000);
+
+  const dueForm = document.getElementById("due-settings-form");
+  const dueResult = document.getElementById("due-settings-result");
+  dueForm?.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const raw = readFormData(dueForm);
+    const settings = {};
+    for (const key of Object.keys(DUE_SETTING_DEFAULTS)) {
+      const value = Number(raw[key]);
+      const [min, max] = DUE_SETTING_LIMITS[key];
+      if (!Number.isInteger(value) || value < min || value > max) {
+        if (dueResult) dueResult.textContent = `Bitte ganze Zahlen zwischen ${min} und ${max} eingeben.`;
+        return;
+      }
+      settings[key] = value;
+    }
+    const status = await saveDueSettings(settings);
+    if (dueResult) dueResult.textContent = status === "ok"
+      ? "Gespeichert."
+      : "Auf diesem Gerät gespeichert – wird an den Server übertragen, sobald wieder Verbindung besteht.";
+  });
+  document.getElementById("due-settings-reset")?.addEventListener("click", () => {
+    for (const [key, value] of Object.entries(DUE_SETTING_DEFAULTS)) {
+      const input = dueForm?.querySelector(`[name="${key}"]`);
+      if (input) input.value = value;
+    }
+    dueForm?.requestSubmit();
+  });
 
   document.getElementById("pdf-export-btn")?.addEventListener("click", async (event) => {
     const btn = event.currentTarget;
@@ -1802,6 +2105,7 @@ function bindSettings() {
     await idbClear("queue");
     localStorage.removeItem("apiToken");
     localStorage.removeItem("lastSync");
+    localStorage.removeItem("dueSettings");
     location.hash = "#/";
     await renderCurrentRoute();
   });
