@@ -56,9 +56,15 @@ function idbPut(store, value) {
 }
 
 function idbDelete(store, key) {
+  // Server-IDs liegen als Zahl im Speicher, aus HTML-Attributen kommen sie als
+  // Text („3“). Deshalb immer beide Varianten löschen.
+  const keys = [key];
+  if (typeof key === "string" && /^\d+$/.test(key)) keys.push(Number(key));
+  else if (typeof key === "number") keys.push(String(key));
   return openDatabase().then(db => new Promise((resolve, reject) => {
     const tx = db.transaction(store, "readwrite");
-    tx.objectStore(store).delete(key);
+    const os = tx.objectStore(store);
+    for (const k of keys) os.delete(k);
     tx.oncomplete = () => resolve();
     tx.onerror = () => reject(tx.error);
   }));
@@ -148,7 +154,9 @@ async function apiFetch(path, { method = "GET", body } = {}) {
       const data = await res.json();
       if (data && data.error) message = data.error;
     } catch (e) { /* ignore */ }
-    throw new Error(message);
+    const err = new Error(message);
+    err.code = res.status;
+    throw err;
   }
 
   if (res.status === 204) return null;
@@ -237,7 +245,11 @@ async function deleteVehicle(id) {
   for (const s of services) await idbDelete("services", s.id);
   const notes = (await idbGetAll("notes")).filter(n => idEq(n.vehicle_id, id));
   for (const n of notes) await idbDelete("notes", n.id);
-  await enqueue("vehicle", "delete", id, null);
+  const attachments = (await idbGetAll("attachments")).filter(a => idEq(a.vehicle_id, id));
+  for (const a of attachments) await idbDelete("attachments", a.id);
+  const alreadyQueued = (await idbGetAll("queue"))
+    .some(q => q.kind === "vehicle" && q.op === "delete" && idEq(q.entityId, id));
+  if (!alreadyQueued) await enqueue("vehicle", "delete", id, null);
   triggerSync();
 }
 
@@ -551,76 +563,84 @@ async function flushQueue() {
 
     if (item.op === "update" && String(entityId).startsWith("tmp-")) break;
 
-    if (item.kind === "settings") {
-      const saved = await apiFetch("/api/settings", { method: "PUT", body: payload });
-      storeDueSettings(saved);
-      await idbDelete("queue", item.localId);
-      continue;
-    }
-
-    if (item.kind === "attachment" && item.op === "create") {
-      const localAttachment = await idbGetById("attachments", item.entityId);
-      if (!localAttachment?.blob) break;
-
-      // Bei einem offline neu angelegten Fahrzeug/Wartung/Notiz können
-      // die IDs noch temporär sein. Immer die tatsächlichen Referenzen
-      // aus dem lokalen Attachment verwenden und bereits aufgelöste
-      // Server-IDs aus idMap einsetzen.
-      payload = { ...(payload || {}) };
-      const attachmentVehicleId = payload.vehicle_id ?? localAttachment.vehicle_id;
-      const attachmentServiceId = payload.service_id ?? localAttachment.service_id;
-      const attachmentNoteId = payload.note_id ?? localAttachment.note_id;
-      if (attachmentVehicleId != null) payload.vehicle_id = idMap[attachmentVehicleId] || attachmentVehicleId;
-      if (attachmentServiceId != null) payload.service_id = idMap[attachmentServiceId] || attachmentServiceId;
-      if (attachmentNoteId != null) payload.note_id = idMap[attachmentNoteId] || attachmentNoteId;
-
-      // Sicherheit: niemals einen Upload ohne Fahrzeug-ID an die API schicken.
-      if (payload.vehicle_id == null || String(payload.vehicle_id).startsWith("tmp-")) break;
-
-      const created = await apiUploadAttachment(localAttachment, payload);
-      idMap[item.entityId] = created.id;
-      await idbDelete("attachments", item.entityId);
-
-      const localVehicle = await idbGetById("vehicles", payload.vehicle_id);
-      if (localVehicle && idEq(localVehicle.photo_attachment_id, item.entityId)) {
-        localVehicle.photo_attachment_id = created.id;
-        await idbPut("vehicles", localVehicle);
+    try {
+      if (item.kind === "settings") {
+        const saved = await apiFetch("/api/settings", { method: "PUT", body: payload });
+        storeDueSettings(saved);
+        await idbDelete("queue", item.localId);
+        continue;
       }
 
-      await idbPut("attachments", created);
-    } else if (item.op === "create") {
-      const created = await apiFetch(kindEndpoint(item.kind), { method: "POST", body: payload });
+      if (item.kind === "attachment" && item.op === "create") {
+        const localAttachment = await idbGetById("attachments", item.entityId);
+        if (!localAttachment?.blob) break;
 
-      if (!idEq(entityId, created.id)) {
-        idMap[entityId] = created.id;
-        await idbDelete(storeFor(item.kind), entityId);
+        // Bei einem offline neu angelegten Fahrzeug/Wartung/Notiz können
+        // die IDs noch temporär sein. Immer die tatsächlichen Referenzen
+        // aus dem lokalen Attachment verwenden und bereits aufgelöste
+        // Server-IDs aus idMap einsetzen.
+        payload = { ...(payload || {}) };
+        const attachmentVehicleId = payload.vehicle_id ?? localAttachment.vehicle_id;
+        const attachmentServiceId = payload.service_id ?? localAttachment.service_id;
+        const attachmentNoteId = payload.note_id ?? localAttachment.note_id;
+        if (attachmentVehicleId != null) payload.vehicle_id = idMap[attachmentVehicleId] || attachmentVehicleId;
+        if (attachmentServiceId != null) payload.service_id = idMap[attachmentServiceId] || attachmentServiceId;
+        if (attachmentNoteId != null) payload.note_id = idMap[attachmentNoteId] || attachmentNoteId;
 
-        if (item.kind === "vehicle") {
-          // Nach dem ersten Server-Sync bekommt ein neues Fahrzeug eine
-          // numerische ID. Die Detailseite muss auf diese ID umgestellt werden.
-          const route = parseRoute();
-          if (route.name === "vehicle" && idEq(route.vehicleId, entityId)) {
-            location.hash = `#/vehicle/${created.id}`;
-          }
-          for (const s of await idbGetAll("services")) {
-            if (idEq(s.vehicle_id, entityId)) { s.vehicle_id = created.id; await idbPut("services", s); }
-          }
-          for (const n of await idbGetAll("notes")) {
-            if (idEq(n.vehicle_id, entityId)) { n.vehicle_id = created.id; await idbPut("notes", n); }
-          }
-          for (const a of await idbGetAll("attachments")) {
-            if (idEq(a.vehicle_id, entityId)) { a.vehicle_id = created.id; await idbPut("attachments", a); }
+        // Sicherheit: niemals einen Upload ohne Fahrzeug-ID an die API schicken.
+        if (payload.vehicle_id == null || String(payload.vehicle_id).startsWith("tmp-")) break;
+
+        const created = await apiUploadAttachment(localAttachment, payload);
+        idMap[item.entityId] = created.id;
+        await idbDelete("attachments", item.entityId);
+
+        const localVehicle = await idbGetById("vehicles", payload.vehicle_id);
+        if (localVehicle && idEq(localVehicle.photo_attachment_id, item.entityId)) {
+          localVehicle.photo_attachment_id = created.id;
+          await idbPut("vehicles", localVehicle);
+        }
+
+        await idbPut("attachments", created);
+      } else if (item.op === "create") {
+        const created = await apiFetch(kindEndpoint(item.kind), { method: "POST", body: payload });
+
+        if (!idEq(entityId, created.id)) {
+          idMap[entityId] = created.id;
+          await idbDelete(storeFor(item.kind), entityId);
+
+          if (item.kind === "vehicle") {
+            // Nach dem ersten Server-Sync bekommt ein neues Fahrzeug eine
+            // numerische ID. Die Detailseite muss auf diese ID umgestellt werden.
+            const route = parseRoute();
+            if (route.name === "vehicle" && idEq(route.vehicleId, entityId)) {
+              location.hash = `#/vehicle/${created.id}`;
+            }
+            for (const s of await idbGetAll("services")) {
+              if (idEq(s.vehicle_id, entityId)) { s.vehicle_id = created.id; await idbPut("services", s); }
+            }
+            for (const n of await idbGetAll("notes")) {
+              if (idEq(n.vehicle_id, entityId)) { n.vehicle_id = created.id; await idbPut("notes", n); }
+            }
+            for (const a of await idbGetAll("attachments")) {
+              if (idEq(a.vehicle_id, entityId)) { a.vehicle_id = created.id; await idbPut("attachments", a); }
+            }
           }
         }
-      }
 
-      await idbPut(storeFor(item.kind), created);
-    } else if (item.op === "update") {
-      const updated = await apiFetch(`${kindEndpoint(item.kind)}/${entityId}`, { method: "PUT", body: payload });
-      await idbPut(storeFor(item.kind), updated);
-    } else if (item.op === "delete") {
-      await apiFetch(`${kindEndpoint(item.kind)}/${entityId}`, { method: "DELETE" });
-      await idbDelete(storeFor(item.kind), entityId);
+        await idbPut(storeFor(item.kind), created);
+      } else if (item.op === "update") {
+        const updated = await apiFetch(`${kindEndpoint(item.kind)}/${entityId}`, { method: "PUT", body: payload });
+        await idbPut(storeFor(item.kind), updated);
+      } else if (item.op === "delete") {
+        await apiFetch(`${kindEndpoint(item.kind)}/${entityId}`, { method: "DELETE" });
+        await idbDelete(storeFor(item.kind), entityId);
+      }
+    } catch (err) {
+      // 404: Der Datensatz existiert auf dem Server nicht (mehr), z.B. weil er
+      // schon gelöscht wurde. Den Eintrag verwerfen, sonst blockiert er jeden
+      // weiteren Sync mit „Nicht gefunden“.
+      if (err.code !== 404) throw err;
+      console.warn("Veralteter Eintrag in der Warteschlange verworfen:", item, err.message);
     }
 
     await idbDelete("queue", item.localId);
