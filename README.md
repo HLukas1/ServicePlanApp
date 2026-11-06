@@ -1,4 +1,14 @@
-# ServicePlan
+<p align="center">
+  <img src="docs/logo.png" alt="ServicePlan Logo" width="160">
+</p>
+
+<h1 align="center">ServicePlan</h1>
+
+<p align="center">
+  <b>Fahrzeuge, Wartungen und Termine im Blick – selbst gehostet, auf allen Geräten.</b>
+</p>
+
+---
 
 **ServicePlan** ist eine selbst gehostete Web-App zur Verwaltung deiner Fahrzeuge und ihrer Wartungen.
 Du installierst sie einmal auf einem eigenen Server und nutzt sie danach im Browser von Smartphone, Tablet und PC.
